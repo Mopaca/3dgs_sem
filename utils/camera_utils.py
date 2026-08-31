@@ -14,6 +14,8 @@ import numpy as np
 from utils.graphics_utils import fov2focal
 from PIL import Image
 import cv2
+import torch
+import random ###
 
 WARNED = False
 
@@ -95,3 +97,80 @@ def camera_to_JSON(id, camera : Camera):
         'fx' : fov2focal(camera.FovX, camera.width)
     }
     return camera_entry
+
+
+# #####
+# def get_camera_center(cam):
+#     """
+#     Return camera center as torch.Tensor of shape [3].
+
+#     Priority:
+#     1) cam.camera_center
+#     2) inverse(world_view_transform)[:3, 3]
+#     """
+#     if hasattr(cam, "camera_center"):
+#         center = cam.camera_center
+#         if not torch.is_tensor(center):
+#             center = torch.tensor(center, dtype=torch.float32, device="cuda")
+#         return center.float()
+
+#     if hasattr(cam, "world_view_transform"):
+#         w2c = cam.world_view_transform
+#         if not torch.is_tensor(w2c):
+#             w2c = torch.tensor(w2c, dtype=torch.float32, device="cuda")
+#         c2w = torch.inverse(w2c)
+#         return c2w[:3, 3].float()
+
+#     raise AttributeError("Camera object must have either 'camera_center' or 'world_view_transform'.")
+
+# def farthest_point_sampling_from_seed(cameras, seed_idx, target_count):
+#     n = len(cameras)
+#     target_count = max(1, min(target_count, n))
+
+#     centers = torch.stack([get_camera_center(cam) for cam in cameras], dim=0)  # [N, 3]
+
+#     selected = [seed_idx]
+#     selected_mask = torch.zeros(n, dtype=torch.bool, device=centers.device)
+#     selected_mask[seed_idx] = True
+
+#     # min distance to selected set
+#     dist = torch.norm(centers - centers[seed_idx:seed_idx+1], dim=1)
+
+#     while len(selected) < target_count:
+#         dist[selected_mask] = -1.0
+#         next_idx = torch.argmax(dist).item()
+
+#         selected.append(next_idx)
+#         selected_mask[next_idx] = True
+
+#         new_dist = torch.norm(centers - centers[next_idx:next_idx+1], dim=1)
+#         dist = torch.minimum(dist, new_dist)
+
+#     return selected
+
+# def select_quarter_views_with_random_seed_and_fps(viewpoint_stack):
+#     """
+#     1) Randomly pick one seed camera
+#     2) Run FPS from that seed
+#     3) Select 1/4 of all train cameras
+#     4) Return selected camera list
+#     """
+#     train_cams = viewpoint_stack
+#     num_views = len(train_cams)
+
+#     if num_views == 0:
+#         return []
+
+#     target_count = max(1, num_views // 4)
+#     seed_idx = random.randint(0, num_views - 1)
+
+#     selected_indices = farthest_point_sampling_from_seed(
+#         cameras=train_cams,
+#         seed_idx=seed_idx,
+#         target_count=target_count,
+#     )
+
+#     selected_cams = [train_cams[i] for i in selected_indices]
+#     return selected_cams, selected_indices, seed_idx
+
+# #####

@@ -97,7 +97,9 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
-        super().__init__(parser, "Optimization Parameters")
+        self.sim_start_iter = 3000 ###
+        self.sim_interval = 10 ###
+        super().__init__(parser, "Optimization Parameters")  
 
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
