@@ -162,18 +162,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             den_grad = aux_grad[:, 1:2].detach()
 
             view_score = num_grad / (den_grad + 1e-8)
-            normalized_radius = normalize_projected_radius(radii=radii, min_radius=1.0, max_radius=70.0)
-            lambda_scale = 0.1
+            normalized_radius = normalize_projected_radius(radii=radii, min_radius=1.0, max_radius=20.0)
+            lambda_scale = 0.3
             scale_weight = (1.0 - lambda_scale * normalized_radius)
             weighted_view_score = (view_score * scale_weight)
             weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
+
+            step = (iteration -1) % 100
+            progress = step / 99.0
+
+            wma_weight = 1.0 + progress
 
             view_visible_mask = visibility_filter.float()
             if view_visible_mask.dim() == 1:
                 view_visible_mask = view_visible_mask.unsqueeze(1)
             
-            visible_mask = view_visible_mask
             visible_mask = view_visible_mask * (den_grad > 1e-6)
+
+            wma_weighted_view_score = weighted_view_score * wma_weight
+            visible_mask = visible_mask * wma_weight
 
             gaussians.accumulate_similarity(weighted_view_score, visible_mask)
             # save_similarity_statistics_json(scene, gaussians, iteration, weighted_view_score, visible_mask)
@@ -206,21 +213,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
-
-        scaling = gaussians.get_scaling
-        min_scale = scaling.min(dim=1).values
-        max_scale = scaling.max(dim=1).values
-        scale_ratio = min_scale / (max_scale + 1e-8)
-        needle_threshold = 0.1
-        needle_mask = scale_ratio < needle_threshold
-
-        if needle_mask.any():
-            needle_loss = (1 - scale_ratio[needle_mask]).mean()
-        else:
-            needle_loss = scaling.sum() * 0.0
-
-        lambda_needle = 0.1
-        # loss += lambda_needle * needle_loss
 
         loss.backward()
 
@@ -289,46 +281,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.reset_similarity_accum() ###
                     gaussians.reset_similarity_aux() ###
                 ###
-                
-                # ###
-                # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                #     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                #     gaussians.finalize_similarity_score() ###
-                #     gaussians.finalize_norm_ratio_score() ###
-                #     print("similarity mean:", gaussians.get_similarity_score.mean(), "similarity std:", gaussians.get_similarity_score.std(unbiased=False))
-                #     if (iteration in saving_iterations):
-                #         save_all_views_priority_similarity_renders(scene=scene, gaussians=gaussians, pipe=pipe, background=background, dataset=dataset, opt=opt, iteration=iteration, dino_sim=dino_sim, current_top_percent=0.0)
-                #         save_score_statistics_json(scene=scene, gaussians=gaussians, opt=opt, iteration=iteration, priority_cutoff=priority_cutoff)
-                #     gaussians.reset_similarity_accum() ###
-                #     gaussians.reset_similarity_aux() ###
-
-                #     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                # ###
-
-                # ###
-                # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                #     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                #     if iteration > opt.sim_start_iter: ###
-                #         gaussians.finalize_similarity_score() ###
-                #         gaussians.finalize_norm_ratio_score() ###
-                #         current_top_percent = gaussians.get_dynamic_similarity_threshold(current_iteration=iteration, densify_until_iter=opt.densify_until_iter, start_threshold=0.4, end_threshold=0.4)
-                #         if (iteration in testing_iterations):
-                #             save_all_views_priority_similarity_renders(scene=scene, gaussians=gaussians, pipe=pipe, background=background, dataset=dataset, opt=opt, iteration=iteration, dino_sim=dino_sim, current_top_percent=current_top_percent)
-                #             save_score_statistics_json(scene=scene, gaussians=gaussians, opt=opt, iteration=iteration, priority_cutoff=priority_cutoff)
-                #         # current_percentile, priority_cutoff, reset_opacity_bool = gaussians.densify_and_prune_by_priority(iteration=iteration, densify_until_iter=opt.densify_until_iter, adc_grad_threshold=opt.densify_grad_threshold, min_opacity=0.005, extent=scene.cameras_extent, max_screen_size=size_threshold, radii=radii, top_percent=0.03, alpha=0.8, beta=0.2, grad_top_percent=0.02, reset_opacity=reset_opacity, split_N=2) ###
-                        
-                #         gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration)
-                #         gaussians.reset_similarity_accum() #
-
-                #     else: ###
-                #         if (iteration in testing_iterations):
-                #             # gaussians.finalize_norm_ratio_score() ###
-                #             gaussians.finalize_similarity_score() ###
-                #             save_all_views_priority_similarity_renders(scene=scene, gaussians=gaussians, pipe=pipe, background=background, dataset=dataset, opt=opt, iteration=iteration, dino_sim=dino_sim, current_top_percent=0.0)
-                #             # save_score_statistics_json(scene=scene, gaussians=gaussians, opt=opt, iteration=iteration, priority_cutoff=priority_cutoff)
-                #         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii) ###
-                #         gaussians.reset_similarity_accum() ###
-                # ###
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -551,7 +503,7 @@ def get_scale_mask(gaussians, iteration):
     # semantic_candidate_mask = (sim_valid_mask & (sim_score >= similarity_threshold2) & (sim_score < similarity_threshold))
     semantic_candidate_mask2 = (sim_valid_mask & (sim_score >= densify_lower) & (sim_score < sim_mean - 2.0 * sim_std))
     semantic_candidate_mask = (sim_valid_mask & (sim_score >= sim_mean - 2.0 * sim_std) & (sim_score < densify_upper))
-    semantic_candidate_mask3 = (sim_valid_mask & (sim_score > 0) & (sim_score < densify_lower) & (sim_score > prune_threshold))
+    semantic_candidate_mask3 = (sim_valid_mask & (sim_score > 0) & (sim_score < densify_lower))
 
     candidate_indices = torch.nonzero(semantic_candidate_mask, as_tuple=False).squeeze(1)
 
@@ -588,8 +540,8 @@ def selected_gaussians_to_color(candidate_mask, selected_mask, candidate_mask2, 
 
     colors = torch.zeros((mask2.shape[0], 3), dtype=torch.float32, device=device)
     colors[mask1] = torch.tensor([1.0, 1.0, 0.0],  dtype=torch.float32, device=device) # yellow
-    colors[mask2] = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float32, device=device) # orange
-    colors[mask3] = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=device) # red
+    colors[mask2] = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=device) # green
+    colors[mask3] = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=device) # blue
     colors[(~(mask1 | mask2 | mask3))] = 0.5 # gray
 
     return colors
@@ -882,8 +834,8 @@ def similarity_to_heat_colors(similarity_score, valid_mask, device="cuda"):
 
     if valid.any():
         valid_scores = score[valid]
-        smin = valid_scores.min()
-        smax = valid_scores.max()
+        smin = 0.0
+        smax = 1.0
 
         norm = torch.zeros_like(score)
         norm[valid] = (valid_scores - smin) / (smax - smin + 1e-8)

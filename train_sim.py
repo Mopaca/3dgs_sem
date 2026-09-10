@@ -24,6 +24,12 @@ from utils.dino_utils import DinoSimilarity ###
 from utils.percentile_utils import get_priority_top_percent, get_dynamic_priority_top_percent ###
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import torchvision.utils as vutils
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import json
+from utils.sh_utils import eval_sh
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -52,16 +58,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     dino_sim = DinoSimilarity(model_name="dinov2_vits14", device="cuda")
-    # dino_sim = DinoSimilarity(family="dinov2", backend="huggingface", hf_model_id="facebook/dinov2-base", device="cuda")
-    # dino_sim = DinoSimilarity(family="dinov3", backend="huggingface", hf_model_id="facebook/dinov3-vitl16-pretrain-lvd1689m", device="cuda")
     gaussians.training_setup(opt)
-    current_percentile = None
+    priority_cutoff = None
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    white_background = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device="cuda")
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    # background = torch.tensor(white_background, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -117,6 +123,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux)
         image, scalar_map, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["scalar_map"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"] ###
 
+        gt_image = viewpoint_cam.original_image.cuda()
+
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
@@ -124,7 +132,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 #####
         sim_map = None
         # do_similarity = iteration >= opt.sim_start_iter and iteration % opt.sim_interval == 0 and iteration < opt.densify_until_iter
-        do_similarity = iteration < opt.densify_until_iter
+        # do_similarity = iteration > 2900 and iteration < opt.densify_until_iter
+        do_similarity = iteration > opt.densify_from_iter and iteration < opt.densify_until_iter
         if do_similarity:
             with torch.no_grad():
                 gt_image = viewpoint_cam.original_image.cuda()
@@ -132,28 +141,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gt_bchw = gt_image.unsqueeze(0)
                 sim_map = dino_sim.cosine_map(img_bchw, gt_bchw).squeeze(0).detach()
 
+                # sim_map, view_sim_mean, view_sim_lower = stretch_similarity_map_below_mean(sim_map, lower_quantile=0.05)
+
             if scalar_map.dim() == 4:
                 scalar_map = scalar_map.squeeze(0)
             if sim_map.dim() == 4:
                 sim_map = sim_map.squeeze(0)
 
+            # view_sim_root = os.path.join(scene.model_path, "similarity heatmap")
+            # os.makedirs(view_sim_root, exist_ok=True)
+            # view_sim_heatmap = similarity_map_to_heatmap(sim_map, value_min=0.0, value_max=1.0)
+            # vutils.save_image(view_sim_heatmap, os.path.join(view_sim_root, f"iter_{iteration:06d}.png"))
+
             aux_loss_num = (sim_map * scalar_map[0:1]).sum()
-            aux_loss_den = (torch.ones_like(scalar_map[1:2]) * scalar_map[1:2]).sum()
-            aux_loss = aux_loss_num + aux_loss_den
+            aux_den = (torch.ones_like(scalar_map[1:2]) * scalar_map[1:2]).sum()
+            aux_loss = aux_loss_num + aux_den
 
             aux_grad = torch.autograd.grad(outputs=aux_loss, inputs=gaussians.get_similarity_aux, retain_graph=True, create_graph=False, allow_unused=False)[0]
             num_grad = aux_grad[:, 0:1].detach()
             den_grad = aux_grad[:, 1:2].detach()
 
             view_score = num_grad / (den_grad + 1e-8)
+            normalized_radius = normalize_projected_radius(radii=radii, min_radius=1.0, max_radius=20.0)
+            lambda_scale = 0.3
+            scale_weight = (1.0 - lambda_scale * normalized_radius)
+            weighted_view_score = (view_score * scale_weight)
+            weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
+
+            step = (iteration -1) % 100
+            progress = step / 99.0
+
+            wma_weight = 1.0 + progress
+
             view_visible_mask = visibility_filter.float()
             if view_visible_mask.dim() == 1:
                 view_visible_mask = view_visible_mask.unsqueeze(1)
             
-            grad_visible_mask = (den_grad > 0.005).float()
-            visible_mask = view_visible_mask * grad_visible_mask
+            visible_mask = view_visible_mask * (den_grad > 1e-6)
+            visible_mask = visible_mask * wma_weight
 
-            gaussians.accumulate_similarity(view_score, visible_mask)
+            gaussians.accumulate_similarity(weighted_view_score, visible_mask)
+            # save_similarity_statistics_json(scene, gaussians, iteration, weighted_view_score, visible_mask)
 
         if iteration == opt.densify_until_iter:
             del dino_sim
@@ -194,17 +222,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                # if iteration > opt.sim_start_iter:
-                #     current_percentile = get_priority_top_percent(iteration=iteration, start_iter=5000, end_iter=15000, start_percent=0.02, end_percent=0.0015)
-                #     priority_percent_str = f"{current_percentile * 100:.4f}%"
-                # else:
-                #     priority_percent_str = "-"
-                # current_percentile = get_priority_top_percent(iteration=iteration, start_iter=5000, end_iter=15000, start_percent=0.02, end_percent=0.0015)
-                if current_percentile == None:
-                    priority_percent_str = "-"
-                else:
-                    priority_percent_str = f"{current_percentile * 100:.4f}%"
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", "Gaussians": f"{gaussians.get_xyz.shape[0]}", "Priority %": priority_percent_str})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", "Gaussians": f"{gaussians.get_xyz.shape[0]}"})
                 progress_bar.update(10)
                     
             if iteration == opt.iterations:
@@ -222,23 +240,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
+                ###
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    # gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    progress = (iteration - 6000) / float(15000 - 6000)
+                    progress = max(0.0, min(1.0, progress))
+                    current_grad_threshold = opt.densify_grad_threshold * (1.0 + progress)
+                    size_threshold = 100 if iteration > opt.opacity_reset_interval else None
+                    gaussians.finalize_similarity_score() ###
+                    gaussians.densify_and_prune_by_similarity(current_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path)
+                    gaussians.reset_similarity_accum() ###
+                    gaussians.reset_similarity_aux() ###
+                ###
 
-                    if iteration > opt.sim_start_iter: ###
-                        gaussians.finalize_similarity_score() ###
-                        # current_percentile = get_priority_top_percent(iteration=iteration, start_iter=5000, end_iter=15000, start_percent=0.03, end_percent=0.002)
-                        current_percentile, _ = gaussians.densify_and_prune_by_priority(iteration=iteration, densify_until_iter=opt.densify_until_iter, adc_grad_threshold=opt.densify_grad_threshold, min_opacity=0.005, extent=scene.cameras_extent, max_screen_size=size_threshold, radii=radii, top_percent=0.02, alpha=0.7, beta=0.3, grad_top_percent=0.02, split_N=2) ###
-                        gaussians.reset_similarity_accum() ###
-                        gaussians.reset_similarity_aux() ###
-                    else: ###
-                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii) ###
-                    # gaussians.finalize_similarity_score() ###
-                    # current_percentile, _ = gaussians.densify_and_prune_by_priority(iteration=iteration, densify_until_iter=opt.densify_until_iter, adc_grad_threshold=opt.densify_grad_threshold, min_opacity=0.005, extent=scene.cameras_extent, max_screen_size=size_threshold, radii=radii, top_percent=0.03, alpha=0.7, beta=0.3, grad_top_percent=0.02, split_N=2) ###
-                    # gaussians.reset_similarity_accum() ###
-                    # gaussians.reset_similarity_aux() ###
-                
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
@@ -260,6 +273,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         if do_similarity: ###
             gaussians.reset_similarity_aux() ###
+
+###
+def normalize_projected_radius(
+    radii,
+    min_radius=1.0,
+    max_radius=20.0,
+    eps=1e-8
+):
+    """
+    radii: [N], current-view projected Gaussian radius
+
+    Returns:
+        normalized_radius: [N, 1], range [0, 1]
+    """
+    normalized_radius = (
+        (radii.detach().float() - min_radius)
+        / (max_radius - min_radius + eps)
+    )
+
+    normalized_radius = normalized_radius.clamp(0.0, 1.0)
+
+    return normalized_radius.unsqueeze(1)
+###
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -333,11 +369,11 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 13_000, 15_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[5000, 10000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

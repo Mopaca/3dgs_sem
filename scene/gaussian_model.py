@@ -1160,7 +1160,7 @@ class GaussianModel:
 
         return final_indices
 
-    def build_semantic_densify_mask(self, sim_score, sim_valid_mask, iteration):
+    def build_semantic_densify_mask(self, sim_score, sim_valid_mask, iteration, global_sample_ratio):
         """
         similarity 분포를 이용하여 semantic densification mask 생성
 
@@ -1179,22 +1179,6 @@ class GaussianModel:
         sim_mean = sim_valid.mean()
         sim_std = sim_valid.std(unbiased=False)
 
-        progress = (iteration - 6000) / float(15000 - 6000)
-        progress = max(0.0, min(1.0, progress))
-
-        kappa = 1.0 + 2.0 * progress
-
-        similarity_threshold = (
-            sim_mean - kappa * sim_std
-        )
-
-        low_boundary = max(0.0, (sim_mean - 3.0 * sim_std).item())
-
-        progress = (iteration - 6000) / float(12000 - 6000)
-        progress = max(0.0, min(1.0, progress))
-
-        prune_threshold = low_boundary * progress
-
 
         # ----------------------------
         # 세 개의 similarity 구간
@@ -1204,15 +1188,8 @@ class GaussianModel:
 
         mask_mid = (sim_valid_mask & (sim_score >= sim_mean - 3.0 * sim_std) & (sim_score < sim_mean - 2.0 * sim_std))
 
-        mask_low = (sim_valid_mask & (sim_score < sim_mean - 3.0 * sim_std) & (sim_score > prune_threshold))
+        mask_low = (sim_valid_mask & (sim_score < sim_mean - 3.0 * sim_std))
 
-        # mask_high = (sim_valid_mask & (sim_score >= sim_mean - 2.0 * sim_std) & (sim_score < sim_mean - 1.0 * sim_std))
-
-        # mask_mid = (sim_valid_mask & (sim_score >= sim_mean - 3.0 * sim_std) & (sim_score < sim_mean - 2.0 * sim_std))
-
-        # mask_low = (sim_valid_mask & (sim_score > 0.0) & (sim_score < sim_mean - 3.0 * sim_std))
-
-        global_sample_ratio = 0.3 - progress * 0.2
         masks = [mask_high, mask_mid, mask_low]
 
         counts = torch.tensor(
@@ -1248,7 +1225,6 @@ class GaussianModel:
         else:
             return semantic_densify_mask
 
-        # global_sample_ratio = 0.3 - progress * 0.2
         sample_ratio = (sample_ratio * global_sample_ratio).clamp(max=1.0)
 
         # ----------------------------
@@ -1268,11 +1244,6 @@ class GaussianModel:
             #
             num_sample = max(1, int(num_candidate * ratio.item()))
             num_sample = min(num_sample, num_candidate)
-
-            # # scale sampling
-            # candidate_scale = gaussian_scale[candidate_indices]
-            # _, top_idx = torch.topk(candidate_scale, k=num_sample, largest=True, sorted=False)
-            # semantic_densify_mask[candidate_indices[top_idx]] = True
 
             #random sampling
             perm = torch.randperm(num_candidate, device=sim_score.device)
@@ -1297,137 +1268,26 @@ class GaussianModel:
         sim_score = self.get_similarity_score.squeeze(1).detach()
         sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >0))
 
-        if sim_valid_mask.any():
-            sim_valid = sim_score[sim_valid_mask]
-            sim_mean = sim_valid.mean()
-            sim_std = sim_valid.std(unbiased=False)
-
-            densify_lower = sim_mean - 2.0 * sim_std
-            densify_upper = sim_mean - sim_std
-
-            # similarity_threshold = self.get_dynamic_similarity_threshold(iteration, 500, 15000, start_threshold=densify_lower, end_threshold=densify_upper)
-            similarity_threshold = self.get_dynamic_similarity_threshold(iteration, densify_from_iter=500, densify_until_iter=15000, start_threshold=sim_mean, end_threshold=densify_upper)
-            similarity_threshold2 = self.get_dynamic_similarity_threshold(iteration, densify_from_iter=500, densify_until_iter=15000, start_threshold=densify_lower, end_threshold=sim_mean - 3.0*sim_std)
-
-            # semantic_candidate_mask = (sim_valid_mask & (sim_score >= densify_lower) & (sim_score < densify_upper))
-            # semantic_candidate_mask = (sim_valid_mask & (sim_score >= similarity_threshold) & (sim_score < sim_mean))
-            # semantic_candidate_mask = (sim_valid_mask & (sim_score >= densify_lower) & (sim_score < sim_mean))
-            # semantic_candidate_mask = (sim_valid_mask & (sim_score >= similarity_threshold2) & (sim_score < similarity_threshold))
-            semantic_candidate_mask = (sim_valid_mask & (sim_score >= sim_mean - 3 * sim_std) & (sim_score < sim_mean - sim_std))
-
-            candidate_indices = torch.nonzero(semantic_candidate_mask, as_tuple=False).squeeze(1)
-            # num_candidates = candidate_indices.numel()
-            
-            semantic_densify_mask = torch.zeros_like(sim_score, dtype=torch.bool)
-            candidate_xyz = self.get_xyz.detach()[candidate_indices]
-            num_candidates = candidate_xyz.shape[0] ###
-            if num_candidates > 0:
-                sample_ratio = 0.01   # 10%
-                num_sample = max(1, int(num_candidates * sample_ratio))
-                num_sample = min(num_sample, num_candidates)
-
-                ### random sampling
-                # perm = torch.randperm(num_candidates, device=sim_score.device)
-                # sampled_indices = candidate_indices[perm[:num_sample]]
-                # semantic_densify_mask[sampled_indices] = True
-
-                ### scale sampling
-                # gaussian_scale = torch.max(self.get_scaling.detach(), dim=1).values
-                # gaussian_scale = torch.prod(self.get_scaling.detach(), dim=1)
-                # candidate_scales = gaussian_scale[candidate_indices]
-                # _, top_idx_in_candidates = torch.topk(candidate_scales, k=num_sample, largest=True, sorted=False)
-                # selected_indices = candidate_indices[top_idx_in_candidates]
-                # semantic_densify_mask[selected_indices] = True
-
-                ### fps
-                # sampled_local_idx = self.farthest_point_sampling(candidate_xyz, num_sample)
-                # sampled_global_idx = candidate_indices[sampled_local_idx]
-                # semantic_densify_mask[sampled_global_idx] = True
-
-                ### hybrid sampling
-                # sampled_indices = self.hybrid_scale_fps_sampling(candidate_indices, final_ratio=0.01, scale_ratio=0.05)
-                # semantic_densify_mask[sampled_indices] = True
-            else:
-                num_sample = 0
-
-            # semantic_prune_candidate = (sim_valid_mask & (sim_score < similarity_threshold))
-            # semantic_prune_candidate = (sim_valid_mask & (sim_score < densify_lower))
-            semantic_prune_candidate = (sim_valid_mask & (sim_score < sim_mean - 3.0 * sim_std))
-            candidate_indices = torch.nonzero(semantic_prune_candidate, as_tuple=False).squeeze(1)
-            num_candidates = candidate_indices.numel()
-            semantic_prune_mask_old = torch.zeros_like(sim_score, dtype=torch.bool)
-            if num_candidates > 0:
-                sample_ratio = 0.05   # 10%
-                num_sample = max(1, int(num_candidates * sample_ratio))
-                num_sample = min(num_sample, num_candidates)
-                perm = torch.randperm(num_candidates, device=sim_score.device)
-                sampled_indices = candidate_indices[perm[:num_sample]]
-                semantic_prune_mask_old[sampled_indices] = True
-
-        else:
-            sim_mean = torch.tensor(0.0, device=sim_score.device, dtype=sim_score.dtype)
-            sim_std = torch.tensor(0.0, device=sim_score.device, dtype=sim_score.dtype)
-            densify_lower = torch.tensor(0.0, device=sim_score.device, dtype=sim_score.dtype)
-            densify_upper = torch.tensor(0.0, device=sim_score.device, dtype=sim_score.dtype)
-            semantic_densify_mask = torch.zeros_like(sim_score, dtype=torch.bool)
-            semantic_prune_mask_old = torch.zeros_like(sim_score, dtype=torch.bool)
-
-        semantic_densify_mask = self.build_semantic_densify_mask(sim_score, sim_valid_mask, iteration)
+        semantic_densify_mask = self.build_semantic_densify_mask(sim_score, sim_valid_mask, iteration, global_sample_ratio=0.5)
         selected_pts_mask_old = grad_mask | semantic_densify_mask
-        # selected_pts_mask_old = grad_mask
-        print(
-            f"[Densify] "
-            f"grad: {grad_mask.sum().item()} ({100*grad_mask.float().mean():.3f}%) | "
-            f"semantic: {semantic_densify_mask.sum().item()} ({100*semantic_densify_mask.float().mean():.3f}%) | "
-            f"union: {selected_pts_mask_old.sum().item()} ({100*selected_pts_mask_old.float().mean():.3f}%)"
-        )
 
         self.tmp_radii = radii
 
-        sim_valid = self.get_similarity_score[self.get_similarity_score > 0]
-
-        old_max_radii2D = self.max_radii2D.clone()
-        old_num_points = self.get_xyz.shape[0]
         self.densify_and_clone_by_selected_mask(selected_pts_mask_old, extent)
         self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)
         
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            # big_points_vs = max_radii2D_padded > max_screen_size
-            # print("big_points_vs:", big_points_vs.sum().item())
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
 
-        low_boundary = max(0.0, (sim_mean - 3.0 * sim_std).item())
-        progress = (iteration - 6000) / float(12000 - 6000)
-        progress = max(0.0, min(1.0, progress))
-
-        prune_threshold = low_boundary * progress
-
-        sim_score = self.get_similarity_score.squeeze(1).detach()
-        sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >0))
-        prune_candidate = (sim_valid_mask & (sim_score > 0.0) & (sim_score < sim_mean - 3.0 * sim_std))
-        candidate_idx = torch.where(prune_candidate)[0]
-        num_prune = int(candidate_idx.numel() * 0.3)
-
-        prune_mask_semantic = torch.zeros_like(prune_candidate, dtype=torch.bool)
-
-        if iteration > 6000:
-            perm = torch.randperm(candidate_idx.numel(), device=candidate_idx.device)
-            prune_idx = candidate_idx[perm[:num_prune]]
-            prune_mask_semantic[prune_idx] = True
-
-        print("[Prune] grad:", prune_mask.sum().item(), "| semantic:", prune_mask_semantic.sum().item())
-        prune_mask = torch.logical_or(prune_mask, prune_mask_semantic)
 
         self.prune_points(prune_mask)
 
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
-        # self.save_similarity_statistics(iteration, sim_mean, sim_std, densify_lower=similarity_threshold, densify_upper=sim_mean, prune_lower=0.0, prune_upper=sim_mean - 3.0 * sim_std, save_dir=model_path)
-        # self.save_adc_statistics(iteration, densify_grad=grad_mask, densify_sim=semantic_densify_mask, densify_union=selected_pts_mask_old, prune_grad=prune_mask1, prune_sim=semantic_prune_mask_padded, prune_union=prune_mask, save_dir=model_path)
         torch.cuda.empty_cache()
     
 #####
