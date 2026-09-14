@@ -178,9 +178,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 view_visible_mask = view_visible_mask.unsqueeze(1)
             
             visible_mask = view_visible_mask * (den_grad > 1e-6)
-
-            wma_weighted_view_score = weighted_view_score * wma_weight
-            visible_mask = visible_mask * wma_weight
+            # visible_mask = visible_mask * wma_weight
 
             gaussians.accumulate_similarity(weighted_view_score, visible_mask)
             # save_similarity_statistics_json(scene, gaussians, iteration, weighted_view_score, visible_mask)
