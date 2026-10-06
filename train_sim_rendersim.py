@@ -181,6 +181,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # visible_mask = visible_mask * wma_weight
 
             gaussians.accumulate_similarity(weighted_view_score, visible_mask)
+            # gaussians.accumulate_similarity(view_score, visible_mask)
             # save_similarity_statistics_json(scene, gaussians, iteration, weighted_view_score, visible_mask)
 
         if iteration == opt.densify_until_iter:
@@ -254,20 +255,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     similarity_colors = selected_gaussians_to_color(similarity_mask, densify_mask, mask3, valid_mask=((gaussians.sim_view_count > 0) & (gaussians.sim_score_accum > 0)))
                     similarity_heat_color  = similarity_to_heat_colors(similarity_score=gaussians.get_similarity_score, valid_mask=((gaussians.sim_view_count > 0) & (gaussians.sim_score_accum > 0)))
                     # grad_color = grad_to_heat_colors(grad_accum=gaussians.xyz_gradient_accum / (gaussians.denom + 1e-8))
-                    grad_color = selected_gaussians_to_color((gaussians.max_radii2D > 50), (gaussians.max_radii2D > 70), (gaussians.max_radii2D > 80), valid_mask=((gaussians.sim_view_count > 0) & (gaussians.sim_score_accum > 0)))
+                    grad_color = selected_gaussians_to_color((gaussians.max_radii2D > 10), (gaussians.max_radii2D > 40), (gaussians.max_radii2D > 70), valid_mask=((gaussians.sim_view_count > 0) & (gaussians.sim_score_accum > 0)))
                     # similarity_heat_color = priority_to_heat_colors(gaussians.sim_view_count, (gaussians.sim_view_count.squeeze(1) > 0))
                     # similarity_heat_color = priority_to_heat_colors(gaussians.get_similarity_score, ((gaussians.sim_view_count.squeeze(1) > 0) & (gaussians.get_similarity_score > 0.0)))
                     os.makedirs(os.path.join(scene.model_path, "test render", "original render"), exist_ok=True)
                     os.makedirs(os.path.join(scene.model_path, "test render", "similarity part render"), exist_ok=True)
                     os.makedirs(os.path.join(scene.model_path, "test render", "similarity render"), exist_ok=True)
                     os.makedirs(os.path.join(scene.model_path, "test render", "grad render"), exist_ok=True)
-                    render_pkg = render(viewpoint_stack1[47], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux)
+                    render_pkg = render(viewpoint_stack1[97], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux)
                     vutils.save_image(render_pkg["render"], os.path.join(scene.model_path, "test render", "original render", f"iter_{iteration:06d}.png"))
-                    render_pkg = render(viewpoint_stack1[47], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=similarity_colors)
+                    render_pkg = render(viewpoint_stack1[97], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=similarity_colors)
                     vutils.save_image(render_pkg["render"], os.path.join(scene.model_path, "test render", "similarity part render", f"iter_{iteration:06d}.png"))
-                    render_pkg = render(viewpoint_stack1[47], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=similarity_heat_color)
+                    render_pkg = render(viewpoint_stack1[97], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=similarity_heat_color)
                     vutils.save_image(render_pkg["render"], os.path.join(scene.model_path, "test render", "similarity render", f"iter_{iteration:06d}.png"))
-                    render_pkg = render(viewpoint_stack1[47], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=grad_color)
+                    render_pkg = render(viewpoint_stack1[97], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=grad_color)
                     vutils.save_image(render_pkg["render"], os.path.join(scene.model_path, "test render", "grad render", f"iter_{iteration:06d}.png"))
                     save_similarity_range_statistics(gaussians=gaussians, iteration=iteration, range_mask_1=similarity_mask, range_mask_2=densify_mask, range_mask_3=mask3, save_dir=scene.model_path)
                     if (iteration in testing_iterations):
@@ -1266,6 +1267,8 @@ def save_all_views_priority_similarity_renders(
         clamp_percentile=0.99
     )
 
+    scale_colors = selected_gaussians_to_color((gaussians.max_radii2D > 10), (gaussians.max_radii2D > 40), (gaussians.max_radii2D > 70), valid_mask=((gaussians.sim_view_count > 0) & (gaussians.sim_score_accum > 0)))
+
     # norm_ratio_color = norm_ratio_map_to_heatcolors(
     #     norm_ratio_score,
     #     sim_valid_mask,
@@ -1280,12 +1283,12 @@ def save_all_views_priority_similarity_renders(
     similarity_root = os.path.join(scene.model_path, "similarity_score", f"iter_{iteration:06d}")
     # gradient_root = os.path.join(scene.model_path, "adc_threshold_binary", f"iter_{iteration:06d}")
     grad_root = os.path.join(scene.model_path, "grad_heamap", f"iter_{iteration:06d}")
-    # norm_root = os.path.join(scene.model_path, "norm_ratio", f"iter_{iteration:06d}")
+    scale_root = os.path.join(scene.model_path, "scale", f"iter_{iteration:06d}")
 
     os.makedirs(priority_root, exist_ok=True)
     os.makedirs(similarity_root, exist_ok=True)
-    # os.makedirs(grad_root, exist_ok=True)
-    # os.makedirs(norm_root, exist_ok=True)
+    os.makedirs(grad_root, exist_ok=True)
+    os.makedirs(scale_root, exist_ok=True)
 
     view_configs = get_consistent_view_configs(scene, mode=mode)
 
@@ -1297,14 +1300,14 @@ def save_all_views_priority_similarity_renders(
         split_similarity_dir = os.path.join(similarity_root, split_name)
         # split_gradient_dir = os.path.join(gradient_root, split_name)
         split_grad_dir = os.path.join(grad_root, split_name)
-        # split_norm_dir = os.path.join(norm_root, split_name)
+        split_scale_dir = os.path.join(scale_root, split_name)
     
 
         os.makedirs(split_priority_dir, exist_ok=True)
         os.makedirs(split_similarity_dir, exist_ok=True)
         # os.makedirs(split_gradient_dir, exist_ok=True)
         os.makedirs(split_grad_dir, exist_ok=True)
-        # os.makedirs(split_norm_dir, exist_ok=True)
+        os.makedirs(split_scale_dir, exist_ok=True)
 
         for idx, view in enumerate(views):
 
@@ -1343,9 +1346,14 @@ def save_all_views_priority_similarity_renders(
             grad_img = render_pkg["render"].detach().clamp(0, 1)
             vutils.save_image(grad_img, os.path.join(split_grad_dir, file_name))
 
-            gt_img = view.original_image[0:3, :, :].cuda()
-            rgb_render_pkg = render(view, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-            rgb_render = rgb_render_pkg["render"].detach().clamp(0,1)
+            # gt_img = view.original_image[0:3, :, :].cuda()
+            # rgb_render_pkg = render(view, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            # rgb_render = rgb_render_pkg["render"].detach().clamp(0,1)
+
+            render_pkg = render(view, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE,
+                                override_color=scale_colors)
+            scale_img = render_pkg["render"].detach().clamp(0,1)
+            vutils.save_image(scale_img, os.path.join(split_scale_dir, file_name))
 
             # ratio_map = dino_sim.norm_ratio_map(rgb_render.unsqueeze(0), gt_img.unsqueeze(0)).squeeze(0)
             # ratio_heatmap = norm_ratio_map_to_heatmap(ratio_map)

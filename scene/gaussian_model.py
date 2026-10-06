@@ -999,6 +999,167 @@ class GaussianModel:
         ))
         self.prune_points(prune_filter)
 
+    def densify_and_split_by_selected_mask_keep_parent(self, selected_pts_mask_old, scene_extent, N=2):
+        """
+        Split selected large Gaussians.
+        selected_pts_mask_old: [K_old] bool
+        """
+        n_init_points = self.get_xyz.shape[0]
+
+        padded_mask = torch.zeros((n_init_points), device="cuda", dtype=torch.bool)
+        padded_mask[:selected_pts_mask_old.shape[0]] = selected_pts_mask_old
+
+        selected_pts_mask = torch.logical_and(
+            padded_mask,
+            torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent
+        )
+
+        if selected_pts_mask.sum() == 0:
+            return
+
+        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
+
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(
+            self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N)
+        )
+        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest, new_opacity,
+            new_scaling, new_rotation, new_tmp_radii
+        )
+
+        # prune_filter = torch.cat((
+        #     selected_pts_mask,
+        #     torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)
+        # ))
+        # self.prune_points(prune_filter)
+
+    # def densify_and_split_by_selected_mask_keep_parent(self, selected_pts_mask_old, scene_extent, shrink_ratio=0.7):
+    #     """
+    #     Selected large Gaussian을 progressive split.
+
+    #     기존 방식:
+    #         parent 1개 삭제
+    #         -> child 2개 생성
+
+    #     변경 방식:
+    #         parent 유지 + scale 축소
+    #         -> child 1개 생성 + scale 축소
+
+    #     Args:
+    #         selected_pts_mask_old: [K_old] bool
+    #         scene_extent: scene extent
+    #         shrink_ratio: parent/child scale 축소 비율
+    #     """
+
+    #     n_init_points = self.get_xyz.shape[0]
+
+    #     # ============================================================
+    #     # 1. 기존 Gaussian 기준 selected mask 확장
+    #     # ============================================================
+
+    #     padded_mask = torch.zeros((n_init_points), device="cuda", dtype=torch.bool)
+    #     padded_mask[:selected_pts_mask_old.shape[0]] = (selected_pts_mask_old)
+
+    #     # 기존과 동일하게 large Gaussian만 split
+    #     selected_pts_mask = torch.logical_and(padded_mask, torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
+    #     num_selected = selected_pts_mask.sum().item()
+
+    #     if num_selected == 0:
+    #         return
+
+    #     # ============================================================
+    #     # 2. Parent 정보 저장
+    #     # ============================================================
+
+    #     parent_xyz = self.get_xyz[selected_pts_mask]
+    #     parent_scaling = self.get_scaling[selected_pts_mask]
+    #     parent_rotation = self._rotation[selected_pts_mask]
+    #     parent_features_dc = self._features_dc[selected_pts_mask]
+    #     parent_features_rest = self._features_rest[selected_pts_mask]
+    #     parent_opacity = self._opacity[selected_pts_mask]
+    #     parent_tmp_radii = self.tmp_radii[selected_pts_mask]
+
+    #     # ============================================================
+    #     # 3. Child 위치 생성
+    #     #
+    #     # 기존 split과 동일하게 parent scale을 std로 사용.
+    #     # child는 하나만 생성.
+    #     # ============================================================
+
+    #     means = torch.zeros((num_selected, 3), device="cuda")
+    #     samples = torch.normal(mean=means, std=parent_scaling)
+    #     rots = build_rotation(parent_rotation)
+
+    #     new_xyz = (torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + parent_xyz)
+
+    #     # ============================================================
+    #     # 4. Child scale 축소
+    #     #
+    #     # 기존:
+    #     # parent_scale / (0.8 * N)
+    #     #
+    #     # 변경:
+    #     # parent_scale * shrink_ratio
+    #     # ============================================================
+
+    #     child_scaling = (parent_scaling * shrink_ratio)
+    #     new_scaling = self.scaling_inverse_activation(child_scaling)
+
+    #     # ============================================================
+    #     # 5. 나머지 child 속성은 parent에서 그대로 복사
+    #     # ============================================================
+
+    #     new_rotation = parent_rotation.clone()
+    #     new_features_dc = parent_features_dc.clone()
+    #     new_features_rest = parent_features_rest.clone()
+    #     new_opacity = parent_opacity.clone()
+    #     new_tmp_radii = parent_tmp_radii.clone()
+
+    #     # ============================================================
+    #     # 6. 기존 Parent scale 축소
+    #     #
+    #     # 주의:
+    #     # self._scaling은 log-space parameter이므로
+    #     # actual scale을 줄인 뒤 inverse activation.
+    #     # ============================================================
+
+    #     new_parent_scaling = (parent_scaling * shrink_ratio)
+    #     self._scaling.data[selected_pts_mask] = (self.scaling_inverse_activation(new_parent_scaling))
+
+    #     # ============================================================
+    #     # 7. Child Gaussian 추가
+    #     # ============================================================
+
+    #     self.densification_postfix(
+    #         new_xyz,
+    #         new_features_dc,
+    #         new_features_rest,
+    #         new_opacity,
+    #         new_scaling,
+    #         new_rotation,
+    #         new_tmp_radii
+    #     )
+
+    #     # ============================================================
+    #     # 8. Parent는 삭제하지 않음
+    #     #
+    #     # 기존 코드의 아래 부분 제거:
+    #     #
+    #     # prune_filter = ...
+    #     # self.prune_points(prune_filter)
+    #     # ============================================================
+
+
     def densify_and_prune_by_priority(
         self,
         iteration,
@@ -1274,7 +1435,11 @@ class GaussianModel:
         self.tmp_radii = radii
 
         self.densify_and_clone_by_selected_mask(selected_pts_mask_old, extent)
-        self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)
+        if iteration < 9000:
+            self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
+        else:
+            self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)
+        
         
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:

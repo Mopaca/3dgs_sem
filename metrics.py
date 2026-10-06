@@ -39,6 +39,7 @@ def evaluate(model_paths):
     per_view_dict = {}
     full_dict_polytopeonly = {}
     per_view_dict_polytopeonly = {}
+    per_patch_dict = {}
     print("")
 
     for scene_dir in model_paths:
@@ -48,6 +49,7 @@ def evaluate(model_paths):
             per_view_dict[scene_dir] = {}
             full_dict_polytopeonly[scene_dir] = {}
             per_view_dict_polytopeonly[scene_dir] = {}
+            per_patch_dict[scene_dir] = {}
 
             test_dir = Path(scene_dir) / "test"
 
@@ -58,6 +60,7 @@ def evaluate(model_paths):
                 per_view_dict[scene_dir][method] = {}
                 full_dict_polytopeonly[scene_dir][method] = {}
                 per_view_dict_polytopeonly[scene_dir][method] = {}
+                per_patch_dict[scene_dir][method] = {}
 
                 method_dir = test_dir / method
                 gt_dir = method_dir/ "gt"
@@ -69,9 +72,15 @@ def evaluate(model_paths):
                 lpipss = []
 
                 for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
+                    render = renders[idx]
+                    gt = gts[idx]
+                    image_name = image_names[idx]
                     ssims.append(ssim(renders[idx], gts[idx]))
                     psnrs.append(psnr(renders[idx], gts[idx]))
                     lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
+
+                    patch_results = compute_patch_metrics(render, gt, grid_size=4)
+                    per_patch_dict[scene_dir][method][image_name] = patch_results
 
                 print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
                 print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
@@ -89,8 +98,76 @@ def evaluate(model_paths):
                 json.dump(full_dict[scene_dir], fp, indent=True)
             with open(scene_dir + "/per_view.json", 'w') as fp:
                 json.dump(per_view_dict[scene_dir], fp, indent=True)
+            with open(scene_dir + "/per_patch.json", 'w') as fp:
+                json.dump(per_patch_dict[scene_dir], fp, indent=True)
         except:
             print("Unable to compute metrics for model", scene_dir)
+
+def compute_patch_metrics(render, gt, grid_size=4):
+    """
+    render, gt: [1, 3, H, W]
+    grid_size: 3 -> 3x3, 4 -> 4x4
+
+    return:
+        {
+            "patch_0_0": {"SSIM": ..., "PSNR": ..., "LPIPS": ...},
+            ...
+        }
+    """
+
+    _, _, H, W = render.shape
+
+    patch_results = {}
+
+    for row in range(grid_size):
+        for col in range(grid_size):
+
+            # 마지막 patch가 남는 pixel까지 포함하도록 계산
+            h_start = (row * H) // grid_size
+            h_end = ((row + 1) * H) // grid_size
+
+            w_start = (col * W) // grid_size
+            w_end = ((col + 1) * W) // grid_size
+
+            render_patch = render[
+                :, :, h_start:h_end, w_start:w_end
+            ]
+
+            gt_patch = gt[
+                :, :, h_start:h_end, w_start:w_end
+            ]
+
+            patch_ssim = ssim(
+                render_patch,
+                gt_patch
+            ).item()
+
+            patch_psnr = psnr(
+                render_patch,
+                gt_patch
+            ).item()
+
+            patch_lpips = lpips(
+                render_patch,
+                gt_patch,
+                net_type='vgg'
+            ).item()
+
+            patch_name = f"patch_{row}_{col}"
+
+            patch_results[patch_name] = {
+                "SSIM": patch_ssim,
+                "PSNR": patch_psnr,
+                "LPIPS": patch_lpips,
+
+                # 나중에 위치 확인용
+                "pixel_range": {
+                    "x": [w_start, w_end],
+                    "y": [h_start, h_end]
+                }
+            }
+
+    return patch_results
 
 if __name__ == "__main__":
     device = torch.device("cuda:0")
