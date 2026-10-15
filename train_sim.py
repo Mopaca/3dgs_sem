@@ -25,9 +25,6 @@ from utils.percentile_utils import get_priority_top_percent, get_dynamic_priorit
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import torchvision.utils as vutils
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import json
 from utils.sh_utils import eval_sh
 
 try:
@@ -141,17 +138,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gt_bchw = gt_image.unsqueeze(0)
                 sim_map = dino_sim.cosine_map(img_bchw, gt_bchw).squeeze(0).detach()
 
-                # sim_map, view_sim_mean, view_sim_lower = stretch_similarity_map_below_mean(sim_map, lower_quantile=0.05)
-
             if scalar_map.dim() == 4:
                 scalar_map = scalar_map.squeeze(0)
             if sim_map.dim() == 4:
                 sim_map = sim_map.squeeze(0)
-
-            # view_sim_root = os.path.join(scene.model_path, "similarity heatmap")
-            # os.makedirs(view_sim_root, exist_ok=True)
-            # view_sim_heatmap = similarity_map_to_heatmap(sim_map, value_min=0.0, value_max=1.0)
-            # vutils.save_image(view_sim_heatmap, os.path.join(view_sim_root, f"iter_{iteration:06d}.png"))
 
             aux_loss_num = (sim_map * scalar_map[0:1]).sum()
             aux_den = (torch.ones_like(scalar_map[1:2]) * scalar_map[1:2]).sum()
@@ -178,10 +168,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 view_visible_mask = view_visible_mask.unsqueeze(1)
             
             visible_mask = view_visible_mask * (den_grad > 1e-6)
-            visible_mask = visible_mask * wma_weight
+            # visible_mask = visible_mask * wma_weight
 
             gaussians.accumulate_similarity(weighted_view_score, visible_mask)
-            # save_similarity_statistics_json(scene, gaussians, iteration, weighted_view_score, visible_mask)
 
         if iteration == opt.densify_until_iter:
             del dino_sim
@@ -369,7 +358,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 13_000, 15_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)

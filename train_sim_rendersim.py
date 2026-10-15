@@ -131,10 +131,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 #####
         sim_map = None
-        # do_similarity = iteration >= opt.sim_start_iter and iteration % opt.sim_interval == 0 and iteration < opt.densify_until_iter
-        # do_similarity = iteration > 2900 and iteration < opt.densify_until_iter
+
         do_similarity = iteration > opt.densify_from_iter and iteration < opt.densify_until_iter
-        if do_similarity:
+        is_final_similarity = (iteration > opt.iterations - 100 and iteration <= opt.iterations)
+        if iteration == opt.iterations - 99:
+            gaussians.reset_similarity_accum()
+        if do_similarity or is_final_similarity:
             with torch.no_grad():
                 gt_image = viewpoint_cam.original_image.cuda()
                 img_bchw = image.unsqueeze(0)
@@ -184,9 +186,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # gaussians.accumulate_similarity(view_score, visible_mask)
             # save_similarity_statistics_json(scene, gaussians, iteration, weighted_view_score, visible_mask)
 
-        if iteration == opt.densify_until_iter:
-            del dino_sim
-            torch.cuda.empty_cache()
+        # if iteration == opt.densify_until_iter:
+        #     del dino_sim
+        #     torch.cuda.empty_cache()
 #####
 
         # Loss
@@ -262,13 +264,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     os.makedirs(os.path.join(scene.model_path, "test render", "similarity part render"), exist_ok=True)
                     os.makedirs(os.path.join(scene.model_path, "test render", "similarity render"), exist_ok=True)
                     os.makedirs(os.path.join(scene.model_path, "test render", "grad render"), exist_ok=True)
-                    render_pkg = render(viewpoint_stack1[97], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux)
+                    render_pkg = render(viewpoint_stack1[47], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux)
                     vutils.save_image(render_pkg["render"], os.path.join(scene.model_path, "test render", "original render", f"iter_{iteration:06d}.png"))
-                    render_pkg = render(viewpoint_stack1[97], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=similarity_colors)
+                    render_pkg = render(viewpoint_stack1[47], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=similarity_colors)
                     vutils.save_image(render_pkg["render"], os.path.join(scene.model_path, "test render", "similarity part render", f"iter_{iteration:06d}.png"))
-                    render_pkg = render(viewpoint_stack1[97], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=similarity_heat_color)
+                    render_pkg = render(viewpoint_stack1[47], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=similarity_heat_color)
                     vutils.save_image(render_pkg["render"], os.path.join(scene.model_path, "test render", "similarity render", f"iter_{iteration:06d}.png"))
-                    render_pkg = render(viewpoint_stack1[97], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=grad_color)
+                    render_pkg = render(viewpoint_stack1[47], gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, similarity_aux=gaussians.get_similarity_aux, override_color=grad_color)
                     vutils.save_image(render_pkg["render"], os.path.join(scene.model_path, "test render", "grad render", f"iter_{iteration:06d}.png"))
                     save_similarity_range_statistics(gaussians=gaussians, iteration=iteration, range_mask_1=similarity_mask, range_mask_2=densify_mask, range_mask_3=mask3, save_dir=scene.model_path)
                     if (iteration in testing_iterations):
@@ -281,9 +283,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.reset_similarity_aux() ###
                 ###
 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                # if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                #     gaussians.reset_opacity()
 
+            # ④ 30000에서 최종 similarity 저장
+            if iteration == opt.iterations:
+                gaussians.finalize_similarity_score()
+                similarity_mask, densify_mask, mask3 = get_scale_mask(gaussians, iteration)
+                save_similarity_range_statistics(gaussians, iteration, similarity_mask, densify_mask, mask3, scene.model_path)
+            
+                save_all_views_priority_similarity_renders(
+                    scene=scene,
+                    gaussians=gaussians,
+                    pipe=pipe,
+                    background=background,
+                    dataset=dataset,
+                    opt=opt,
+                    iteration=iteration,
+                    current_top_percent=0.0,
+                    mode="render_py"
+                )
+            
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
@@ -300,7 +320,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
         
-        if do_similarity: ###
+        if do_similarity or is_final_similarity: ###
             gaussians.reset_similarity_aux() ###
 
 def prepare_output_and_logger(args):    
@@ -1267,7 +1287,11 @@ def save_all_views_priority_similarity_renders(
         clamp_percentile=0.99
     )
 
+
     scale_colors = selected_gaussians_to_color((gaussians.max_radii2D > 10), (gaussians.max_radii2D > 40), (gaussians.max_radii2D > 70), valid_mask=((gaussians.sim_view_count > 0) & (gaussians.sim_score_accum > 0)))
+
+    scale_colors = selected_gaussians_to_color((gaussians.max_radii2D > 20), (gaussians.max_radii2D > 20), (gaussians.max_radii2D > 20), valid_mask=((gaussians.sim_view_count > 0) & (gaussians.sim_score_accum > 0)))
+
 
     # norm_ratio_color = norm_ratio_map_to_heatcolors(
     #     norm_ratio_score,
@@ -1287,7 +1311,11 @@ def save_all_views_priority_similarity_renders(
 
     os.makedirs(priority_root, exist_ok=True)
     os.makedirs(similarity_root, exist_ok=True)
+
     os.makedirs(grad_root, exist_ok=True)
+
+    # os.makedirs(grad_root, exist_ok=True)
+
     os.makedirs(scale_root, exist_ok=True)
 
     view_configs = get_consistent_view_configs(scene, mode=mode)
@@ -1299,14 +1327,22 @@ def save_all_views_priority_similarity_renders(
         split_priority_dir = os.path.join(priority_root, split_name)
         split_similarity_dir = os.path.join(similarity_root, split_name)
         # split_gradient_dir = os.path.join(gradient_root, split_name)
+
         split_grad_dir = os.path.join(grad_root, split_name)
+
+        # split_grad_dir = os.path.join(grad_root, split_name)
+
         split_scale_dir = os.path.join(scale_root, split_name)
     
 
         os.makedirs(split_priority_dir, exist_ok=True)
         os.makedirs(split_similarity_dir, exist_ok=True)
         # os.makedirs(split_gradient_dir, exist_ok=True)
+
         os.makedirs(split_grad_dir, exist_ok=True)
+
+        # os.makedirs(split_grad_dir, exist_ok=True)
+
         os.makedirs(split_scale_dir, exist_ok=True)
 
         for idx, view in enumerate(views):
@@ -1342,9 +1378,9 @@ def save_all_views_priority_similarity_renders(
             sim_img = sim_render_pkg["render"].detach().clamp(0, 1)
             vutils.save_image(sim_img, os.path.join(split_similarity_dir, file_name))
 
-            render_pkg = render(view, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, override_color=grad_colors)
-            grad_img = render_pkg["render"].detach().clamp(0, 1)
-            vutils.save_image(grad_img, os.path.join(split_grad_dir, file_name))
+            # render_pkg = render(view, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, override_color=grad_colors)
+            # grad_img = render_pkg["render"].detach().clamp(0, 1)
+            # vutils.save_image(grad_img, os.path.join(split_grad_dir, file_name))
 
             # gt_img = view.original_image[0:3, :, :].cuda()
             # rgb_render_pkg = render(view, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
@@ -1783,7 +1819,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 13_000, 15_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 13_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])

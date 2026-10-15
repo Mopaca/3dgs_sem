@@ -999,6 +999,228 @@ class GaussianModel:
         ))
         self.prune_points(prune_filter)
 
+    def densify_and_split_by_selected_mask2(self, gradient_mask_old, semantic_mask_old, scene_extent, N=2, semantic_offset_ratio=0.75, semantic_minor_scale_ratio=0.8,):
+        """
+        Gradient-selected Gaussians:
+            Original random split.
+    
+        Semantic-only Gaussians:
+            Principal-axis symmetric split.
+            - Child positions:
+                parent center +/- semantic_offset_ratio * max_scale
+                along the principal axis
+            - Child scaling:
+                principal axis -> original ADC scale reduction
+                                  1 / (0.8 * N)
+                                  = 0.625 when N=2
+                other axes     -> semantic_minor_scale_ratio
+                                  = 0.8 by default
+            - Other attributes:
+                inherited from parent
+    
+        gradient_mask_old: [K_old] bool
+        semantic_mask_old: [K_old] bool
+        """
+    
+        if N != 2:
+            raise ValueError("Semantic symmetric split requires N=2.")
+    
+        n_init_points = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+    
+        # ==========================================================
+        # 1. Prepare selection masks
+        # ==========================================================
+    
+        gradient_mask = torch.zeros(n_init_points, device=device, dtype=torch.bool)
+        semantic_mask = torch.zeros(n_init_points, device=device, dtype=torch.bool)
+    
+        gradient_mask_old = gradient_mask_old.reshape(-1).to(device=device, dtype=torch.bool)
+        semantic_mask_old = semantic_mask_old.reshape(-1).to(device=device, dtype=torch.bool)
+    
+        if (gradient_mask_old.numel() > n_init_points or semantic_mask_old.numel() > n_init_points):
+            raise ValueError("Selection mask exceeds Gaussian count.")
+    
+        gradient_mask[:gradient_mask_old.numel()] = gradient_mask_old
+        semantic_mask[:semantic_mask_old.numel()] = semantic_mask_old
+    
+        # Only large Gaussians are split.
+        large_mask = (torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
+    
+        # Gradient selection has priority.
+        gradient_split_mask = gradient_mask & large_mask
+    
+        # Semantic-only selection.
+        semantic_split_mask = (semantic_mask & ~gradient_mask & large_mask)
+    
+        n_grad = int(gradient_split_mask.sum().item())
+        n_sem = int(semantic_split_mask.sum().item())
+    
+        if n_grad + n_sem == 0:
+            return
+    
+        # ==========================================================
+        # 2. Gradient-based split (Original ADC)
+        # ==========================================================
+    
+        if n_grad > 0:
+            grad_stds = (self.get_scaling[gradient_split_mask].repeat(N, 1))
+            grad_means = torch.zeros_like(grad_stds)
+            grad_samples = torch.normal(mean=grad_means, std=grad_stds)
+            grad_rots = build_rotation(self._rotation[gradient_split_mask]).repeat(N, 1, 1)
+            grad_new_xyz = (torch.bmm(grad_rots, grad_samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[gradient_split_mask].repeat(N, 1))
+    
+            # Original ADC:
+            # all axes -> 1 / (0.8 * N)
+            # N=2 -> 0.625
+            grad_new_scaling = self.scaling_inverse_activation(self.get_scaling[gradient_split_mask].repeat(N, 1) / (0.8 * N))
+    
+        # ==========================================================
+        # 3. Semantic-only split (Proposed)
+        # ==========================================================
+    
+        if n_sem > 0:
+    
+            # ------------------------------------------------------
+            # 3-1. Parent attributes
+            # ------------------------------------------------------
+    
+            sem_parent_xyz = self.get_xyz[semantic_split_mask]
+            sem_parent_scaling = self.get_scaling[semantic_split_mask]
+            sem_parent_rotation = self._rotation[semantic_split_mask]
+    
+            # ------------------------------------------------------
+            # 3-2. Find principal axis
+            # ------------------------------------------------------
+    
+            max_scale, max_idx = torch.max(sem_parent_scaling, dim=1)
+    
+            # ------------------------------------------------------
+            # 3-3. Calculate local offset
+            #
+            # offset = semantic_offset_ratio * principal scale
+            # ------------------------------------------------------
+    
+            offset_local = torch.zeros_like(sem_parent_scaling)
+            offset_local.scatter_(1, max_idx.unsqueeze(1), (max_scale * semantic_offset_ratio).unsqueeze(1))
+    
+            # ------------------------------------------------------
+            # 3-4. Transform offset to world coordinates
+            # ------------------------------------------------------
+    
+            sem_rots = build_rotation(sem_parent_rotation)
+            offset_world = torch.bmm(sem_rots, offset_local.unsqueeze(-1)).squeeze(-1)
+    
+            # ------------------------------------------------------
+            # 3-5. Symmetric child positions
+            #
+            # child 1 = parent + offset
+            # child 2 = parent - offset
+            # ------------------------------------------------------
+    
+            sem_child1_xyz = (sem_parent_xyz + offset_world)
+            sem_child2_xyz = (sem_parent_xyz - offset_world)
+            sem_new_xyz = torch.cat([sem_child1_xyz, sem_child2_xyz], dim=0)
+    
+            # ------------------------------------------------------
+            # 3-6. Semantic child scaling
+            #
+            # Principal axis:
+            #     1 / (0.8 * N)
+            #     = 0.625 when N=2
+            #
+            # Other axes:
+            #     semantic_minor_scale_ratio
+            #     = 0.8 by default
+            # ------------------------------------------------------
+    
+            # First reduce every axis to 0.8 * parent scale.
+            sem_child_scaling = (sem_parent_scaling * semantic_minor_scale_ratio)
+    
+            # Then overwrite the principal axis with
+            # the original ADC reduction.
+            principal_child_scale = (max_scale / (0.8 * N))
+            sem_child_scaling.scatter_(1, max_idx.unsqueeze(1), principal_child_scale.unsqueeze(1))
+    
+            # Same scale for both symmetric children.
+            sem_new_scaling = self.scaling_inverse_activation(sem_child_scaling.repeat(N, 1))
+    
+        # ==========================================================
+        # 4. Combine children
+        # ==========================================================
+    
+        child_xyz_list = []
+        child_scaling_list = []
+        child_rotation_list = []
+        child_features_dc_list = []
+        child_features_rest_list = []
+        child_opacity_list = []
+        child_tmp_radii_list = []
+    
+        # ----------------------------------------------------------
+        # 4-1. Gradient children
+        # ----------------------------------------------------------
+    
+        if n_grad > 0:
+            child_xyz_list.append(grad_new_xyz)
+            child_scaling_list.append(grad_new_scaling)
+            child_rotation_list.append(self._rotation[gradient_split_mask].repeat(N, 1))
+            child_features_dc_list.append(self._features_dc[gradient_split_mask].repeat(N, 1, 1))
+            child_features_rest_list.append(self._features_rest[gradient_split_mask].repeat(N, 1, 1))
+            child_opacity_list.append(self._opacity[gradient_split_mask].repeat(N, 1))
+            child_tmp_radii_list.append(self.tmp_radii[gradient_split_mask].repeat(N))
+    
+        # ----------------------------------------------------------
+        # 4-2. Semantic children
+        # ----------------------------------------------------------
+    
+        if n_sem > 0:
+            child_xyz_list.append(sem_new_xyz)
+            child_scaling_list.append(sem_new_scaling)
+    
+            # Rotation remains identical to parent.
+            child_rotation_list.append(self._rotation[semantic_split_mask].repeat(N, 1))
+            child_features_dc_list.append(self._features_dc[semantic_split_mask].repeat(N, 1, 1))
+            child_features_rest_list.append(self._features_rest[semantic_split_mask].repeat(N, 1, 1))
+            child_opacity_list.append(self._opacity[semantic_split_mask].repeat(N, 1))
+            child_tmp_radii_list.append(self.tmp_radii[semantic_split_mask].repeat(N))
+    
+        # ----------------------------------------------------------
+        # 4-3. Concatenate all children
+        # ----------------------------------------------------------
+    
+        new_xyz = torch.cat(child_xyz_list, dim=0)
+        new_scaling = torch.cat(child_scaling_list, dim=0)
+        new_rotation = torch.cat(child_rotation_list, dim=0)
+        new_features_dc = torch.cat(child_features_dc_list, dim=0)
+        new_features_rest = torch.cat(child_features_rest_list, dim=0)
+        new_opacity = torch.cat(child_opacity_list, dim=0)
+        new_tmp_radii = torch.cat(child_tmp_radii_list, dim=0)
+    
+        # ==========================================================
+        # 5. Add children
+        # ==========================================================
+    
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_tmp_radii
+        )
+    
+        # ==========================================================
+        # 6. Remove split parents
+        # ==========================================================
+    
+        selected_pts_mask = (gradient_split_mask | semantic_split_mask)
+        n_new_children = (N * (n_grad + n_sem))
+        
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(n_new_children, device=device, dtype=torch.bool)))
+        self.prune_points(prune_filter)
+
     def densify_and_split_by_selected_mask_keep_parent(self, selected_pts_mask_old, scene_extent, N=2):
         """
         Split selected large Gaussians.
@@ -1371,13 +1593,13 @@ class GaussianModel:
         region_ratio = counts / sim_score.numel()
         valid_region = counts > 0
 
-        inv_ratio = torch.zeros_like(region_ratio)
-
         # sampling ratio
         # ratio not normalized
-        # sample_ratio = 1.0 / (region_ratio * 100.0)
+        # sample_ratio = torch.zeros_like(region_ratio)
+        # sample_ratio[valid_region] = (1.0 / (region_ratio[valid_region] * 100.0))
 
         # ratio normalized
+        inv_ratio = torch.zeros_like(region_ratio)
         inv_ratio[valid_region] = (1.0 / region_ratio[valid_region])
         sample_ratio = inv_ratio / inv_ratio.sum()
 
@@ -1429,17 +1651,20 @@ class GaussianModel:
         sim_score = self.get_similarity_score.squeeze(1).detach()
         sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >0))
 
-        semantic_densify_mask = self.build_semantic_densify_mask(sim_score, sim_valid_mask, iteration, global_sample_ratio=0.5)
+        semantic_densify_mask = self.build_semantic_densify_mask(sim_score, sim_valid_mask, iteration, global_sample_ratio=0.3)
         selected_pts_mask_old = grad_mask | semantic_densify_mask
 
         self.tmp_radii = radii
 
         self.densify_and_clone_by_selected_mask(selected_pts_mask_old, extent)
-        if iteration < 9000:
-            self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
-        else:
-            self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)
-        
+        # self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
+        # if iteration < 9000:
+        #     self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
+        # else:
+        #     self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)        
+        # self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
+
+        self.densify_and_split_by_selected_mask2(gradient_mask_old=grad_mask, semantic_mask_old=semantic_densify_mask, scene_extent=extent, N=2, semantic_offset_ratio=0.75, semantic_minor_scale_ratio=0.8)
         
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:

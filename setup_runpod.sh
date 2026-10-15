@@ -115,7 +115,8 @@ python -m pip install \
     tqdm \
     plyfile \
     opencv-python \
-    tensorboard
+    tensorboard \
+    matplotlib==3.8.4
 
 
 # --------------------------------------------------
@@ -136,155 +137,155 @@ python -m pip install \
     fvcore \
     iopath
 
-# --------------------------------------------------
-# Dataset Setup - Mip-NeRF 360
-# --------------------------------------------------
+# # --------------------------------------------------
+# # Dataset Setup - Mip-NeRF 360
+# # --------------------------------------------------
 
-echo ""
-echo "[Dataset] Setting up Mip-NeRF 360 dataset..."
+# echo ""
+# echo "[Dataset] Setting up Mip-NeRF 360 dataset..."
 
-DATASET_ROOT="$PROJECT_DIR/datasets"
-NERF360_DIR="$DATASET_ROOT/NeRF360"
+# DATASET_ROOT="$PROJECT_DIR/datasets"
+# NERF360_DIR="$DATASET_ROOT/NeRF360"
 
-mkdir -p "$DATASET_ROOT"
-mkdir -p "$NERF360_DIR"
+# mkdir -p "$DATASET_ROOT"
+# mkdir -p "$NERF360_DIR"
 
-cd "$NERF360_DIR"
-
-
-# --------------------------------------------------
-# Download helper
-# --------------------------------------------------
-
-download_file () {
-
-    URL="$1"
-    OUTPUT="$2"
-
-    if [ -f "$OUTPUT" ]; then
-        echo "$OUTPUT already exists - skipping download."
-        return
-    fi
-
-    echo ""
-    echo "Downloading $OUTPUT..."
-
-    wget \
-        --show-progress \
-        --continue \
-        "$URL" \
-        -O "$OUTPUT"
-}
+# cd "$NERF360_DIR"
 
 
-# --------------------------------------------------
-# 1. Standard Mip-NeRF 360 scenes
-#
-# bicycle
-# bonsai
-# counter
-# garden
-# kitchen
-# room
-# stump
-# --------------------------------------------------
+# # --------------------------------------------------
+# # Download helper
+# # --------------------------------------------------
 
-BASE_ZIP="360_v2.zip"
+# download_file () {
 
-download_file \
-    "http://storage.googleapis.com/gresearch/refraw360/360_v2.zip" \
-    "$BASE_ZIP"
+#     URL="$1"
+#     OUTPUT="$2"
 
+#     if [ -f "$OUTPUT" ]; then
+#         echo "$OUTPUT already exists - skipping download."
+#         return
+#     fi
 
-echo ""
-echo "Extracting standard Mip-NeRF 360 scenes..."
+#     echo ""
+#     echo "Downloading $OUTPUT..."
 
-unzip -q -o "$BASE_ZIP"
-
-echo "Standard scenes extracted."
+#     wget \
+#         --show-progress \
+#         --continue \
+#         "$URL" \
+#         -O "$OUTPUT"
+# }
 
 
-# --------------------------------------------------
-# 2. Extra scenes
-#
-# flowers
-# treehill
-# --------------------------------------------------
+# # --------------------------------------------------
+# # 1. Standard Mip-NeRF 360 scenes
+# #
+# # bicycle
+# # bonsai
+# # counter
+# # garden
+# # kitchen
+# # room
+# # stump
+# # --------------------------------------------------
 
-EXTRA_ZIP="360_extra_scenes.zip"
+# BASE_ZIP="360_v2.zip"
 
-download_file \
-    "https://storage.googleapis.com/gresearch/refraw360/360_extra_scenes.zip" \
-    "$EXTRA_ZIP"
-
-
-echo ""
-echo "Extracting extra scenes..."
-
-unzip -q -o "$EXTRA_ZIP"
-
-echo "Extra scenes extracted."
+# download_file \
+#     "http://storage.googleapis.com/gresearch/refraw360/360_v2.zip" \
+#     "$BASE_ZIP"
 
 
-# --------------------------------------------------
-# Remove zip files after successful extraction
-# --------------------------------------------------
+# echo ""
+# echo "Extracting standard Mip-NeRF 360 scenes..."
 
-echo ""
-echo "Removing downloaded ZIP files..."
+# unzip -q -o "$BASE_ZIP"
 
-rm -f "$BASE_ZIP"
-rm -f "$EXTRA_ZIP"
+# echo "Standard scenes extracted."
 
 
-# --------------------------------------------------
-# Dataset verification
-# --------------------------------------------------
+# # --------------------------------------------------
+# # 2. Extra scenes
+# #
+# # flowers
+# # treehill
+# # --------------------------------------------------
 
-echo ""
-echo "======================================"
-echo "Mip-NeRF 360 Dataset"
-echo "======================================"
+# EXTRA_ZIP="360_extra_scenes.zip"
 
-EXPECTED_SCENES=(
-    bicycle
-    bonsai
-    counter
-    flowers
-    garden
-    kitchen
-    room
-    stump
-    treehill
-)
-
-for SCENE in "${EXPECTED_SCENES[@]}"; do
-
-    if [ -d "$NERF360_DIR/$SCENE" ]; then
-
-        IMAGE_COUNT=0
-
-        if [ -d "$NERF360_DIR/$SCENE/images" ]; then
-            IMAGE_COUNT=$(find "$NERF360_DIR/$SCENE/images" \
-                -type f | wc -l)
-        fi
-
-        echo "[OK] $SCENE - images: $IMAGE_COUNT"
-
-    else
-
-        echo "[MISSING] $SCENE"
-
-    fi
-
-done
+# download_file \
+#     "https://storage.googleapis.com/gresearch/refraw360/360_extra_scenes.zip" \
+#     "$EXTRA_ZIP"
 
 
-echo ""
-echo "Dataset directory:"
-echo "$NERF360_DIR"
+# echo ""
+# echo "Extracting extra scenes..."
 
-cd "$PROJECT_DIR"
+# unzip -q -o "$EXTRA_ZIP"
+
+# echo "Extra scenes extracted."
+
+
+# # --------------------------------------------------
+# # Remove zip files after successful extraction
+# # --------------------------------------------------
+
+# echo ""
+# echo "Removing downloaded ZIP files..."
+
+# rm -f "$BASE_ZIP"
+# rm -f "$EXTRA_ZIP"
+
+
+# # --------------------------------------------------
+# # Dataset verification
+# # --------------------------------------------------
+
+# echo ""
+# echo "======================================"
+# echo "Mip-NeRF 360 Dataset"
+# echo "======================================"
+
+# EXPECTED_SCENES=(
+#     bicycle
+#     bonsai
+#     counter
+#     flowers
+#     garden
+#     kitchen
+#     room
+#     stump
+#     treehill
+# )
+
+# for SCENE in "${EXPECTED_SCENES[@]}"; do
+
+#     if [ -d "$NERF360_DIR/$SCENE" ]; then
+
+#         IMAGE_COUNT=0
+
+#         if [ -d "$NERF360_DIR/$SCENE/images" ]; then
+#             IMAGE_COUNT=$(find "$NERF360_DIR/$SCENE/images" \
+#                 -type f | wc -l)
+#         fi
+
+#         echo "[OK] $SCENE - images: $IMAGE_COUNT"
+
+#     else
+
+#         echo "[MISSING] $SCENE"
+
+#     fi
+
+# done
+
+
+# echo ""
+# echo "Dataset directory:"
+# echo "$NERF360_DIR"
+
+# cd "$PROJECT_DIR"
 
 # --------------------------------------------------
 # 6. Check / patch custom rasterizer config
