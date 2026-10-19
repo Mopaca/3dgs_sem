@@ -231,7 +231,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 ###
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 100 if iteration > opt.opacity_reset_interval else None
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.finalize_similarity_score() ###
                     gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path)
                     gaussians.reset_similarity_accum() ###

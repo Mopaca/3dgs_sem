@@ -245,11 +245,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 ###
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    progress = (iteration - 6000) / float(15000 - 6000)
-                    progress = max(0.0, min(1.0, progress))
-
-                    current_grad_threshold = opt.densify_grad_threshold * (1.0 + progress)
-                    size_threshold = 100 if iteration > opt.opacity_reset_interval else None
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.finalize_similarity_score() ###
                     # save_final_similarity_comparison_json(scene, gaussians, iteration)
                     viewpoint_stack1 = scene.getTrainCameras().copy()
@@ -277,7 +273,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         save_all_views_priority_similarity_renders(scene=scene, gaussians=gaussians, pipe=pipe, background=background, dataset=dataset, opt=opt, iteration=iteration, current_top_percent=0.0)
                         # save_similarity_scale_statistics_json(scene=scene, gaussians=gaussians, iteration=iteration)
                     # gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path)
-                    gaussians.densify_and_prune_by_similarity(current_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path)
+                    gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path)
                     # gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                     gaussians.reset_similarity_accum() ###
                     gaussians.reset_similarity_aux() ###
