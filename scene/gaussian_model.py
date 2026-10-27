@@ -87,7 +87,9 @@ class GaussianModel:
         self.sim_score_accum = torch.empty(0) ###
         self.sim_view_count = torch.empty(0) ###
         self.similarity_score = torch.empty(0) ###
-        self.sim_radius_accum = torch.empty(0) ### sum of projected radius over valid views (logging, radius control)
+        # per-Gaussian sums over the valid views of the current interval (diagnostics, radius control):
+        #   [:, 0] projected radius (px), [:, 1] scale weight, [:, 2] unweighted view score (clamped to [0, 1])
+        self.sim_diag_accum = torch.empty(0) ###
 
     def capture(self):
         return (
@@ -252,7 +254,7 @@ class GaussianModel:
         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
-        self.sim_radius_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+        self.sim_diag_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda") ###
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -339,8 +341,8 @@ class GaussianModel:
         self.sim_score_accum.zero_()
         self.sim_view_count.zero_()
         self.similarity_score.zero_()
-        if self.sim_radius_accum.numel() == self.sim_view_count.numel():
-            self.sim_radius_accum.zero_()
+        if self._diag_ready(self.sim_view_count.shape[0]):
+            self.sim_diag_accum.zero_()
     
     def reset_similarity_aux(self):
         with torch.no_grad():
@@ -404,18 +406,23 @@ class GaussianModel:
         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
-        self.sim_radius_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+        self.sim_diag_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda") ###
 
         self.active_sh_degree = self.max_sh_degree
 
 #####
-    def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None):
+    def _diag_ready(self, n):
+        return self.sim_diag_accum.dim() == 2 and self.sim_diag_accum.shape[0] == n
+
+    def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None, scale_weight=None, raw_score=None):
         """
         view_score:   [N, 1] weighted view score of the current view
         visible_mask: [N, 1] float, 1 for valid views (visible and contribution sum > tau_v)
         agg:          "mean" (proposed; identical to the previous implementation),
                       "min" (worst view of a goodness score), "max" (worst view of an error score, [9])
         radius:       [N, 1] projected radius of the current view (optional, for logging / radius control)
+        scale_weight: [N, 1] scale weight applied in the current view (optional, diagnostics)
+        raw_score:    [N, 1] view score before the scale weight, clamped to [0, 1] (optional, diagnostics)
         """
         if agg == "mean":
             self.sim_score_accum += view_score * visible_mask
@@ -427,8 +434,10 @@ class GaussianModel:
         else:
             raise ValueError(f"Unknown view aggregation: {agg}")
         self.sim_view_count += visible_mask
-        if radius is not None and self.sim_radius_accum.numel() == self.sim_view_count.numel():
-            self.sim_radius_accum += radius * visible_mask
+        if self._diag_ready(self.sim_view_count.shape[0]):
+            for col, value in ((0, radius), (1, scale_weight), (2, raw_score)):
+                if value is not None:
+                    self.sim_diag_accum[:, col:col + 1] += value * visible_mask
         # self.sim_score_accum += view_score
 
     def finalize_similarity_score(self, eps=1e-8, agg="mean"):
@@ -444,10 +453,21 @@ class GaussianModel:
 
     def get_mean_projected_radius(self):
         """[N] mean projected radius (px) over the valid views of the current interval, 0 if unseen."""
+        return self._diag_mean(0)
+
+    def get_mean_scale_weight(self):
+        """[N] mean scale weight over the valid views of the current interval, 0 if unseen."""
+        return self._diag_mean(1)
+
+    def get_unweighted_similarity(self):
+        """[N] mean view score without the scale weight (same views, same [0, 1] clamp), 0 if unseen."""
+        return self._diag_mean(2)
+
+    def _diag_mean(self, col):
         count = self.sim_view_count.squeeze(1)
-        if self.sim_radius_accum.numel() != count.numel():
+        if not self._diag_ready(count.shape[0]):
             return torch.zeros_like(count)
-        return self.sim_radius_accum.squeeze(1) / count.clamp_min(1.0)
+        return self.sim_diag_accum[:, col] / count.clamp_min(1.0)
 #####
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -694,8 +714,8 @@ class GaussianModel:
         self.sim_score_accum = self.sim_score_accum[valid_points_mask] ###
         self.sim_view_count = self.sim_view_count[valid_points_mask] ###
         self.similarity_score = self.similarity_score[valid_points_mask] ###
-        if self.sim_radius_accum.numel() == valid_points_mask.numel(): ###
-            self.sim_radius_accum = self.sim_radius_accum[valid_points_mask] ###
+        if self._diag_ready(valid_points_mask.shape[0]): ###
+            self.sim_diag_accum = self.sim_diag_accum[valid_points_mask] ###
         self._similarity_aux = nn.Parameter(self._similarity_aux[valid_points_mask].detach().requires_grad_(True)) ###
 
 
@@ -746,8 +766,8 @@ class GaussianModel:
         self.sim_score_accum = torch.cat([self.sim_score_accum, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
         self.sim_view_count = torch.cat([self.sim_view_count, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
         self.similarity_score = torch.cat([self.similarity_score, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
-        if self.sim_radius_accum.numel() == self.sim_score_accum.numel() - new_count: ###
-            self.sim_radius_accum = torch.cat([self.sim_radius_accum, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+        if self._diag_ready(self.sim_score_accum.shape[0] - new_count): ###
+            self.sim_diag_accum = torch.cat([self.sim_diag_accum, torch.zeros((new_count, 3), device="cuda")], dim=0) ###
         self._similarity_aux = nn.Parameter(torch.cat([self._similarity_aux.detach(), torch.zeros((new_count, 3), device="cuda")], dim=0).requires_grad_(True)) ###
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):

@@ -63,6 +63,12 @@ class SemLogger:
             if rho is not None:
                 self._shadow_corr.append(rho)
 
+    def save_arrays(self, prefix, iteration, arrays):
+        """Extra per-Gaussian arrays, e.g. scale-weight diagnostics: sem_snapshots/<prefix>_iter_XXXXX.npz"""
+        if not self.enabled or arrays is None:
+            return
+        np.savez_compressed(os.path.join(self.snapshot_dir, f"{prefix}_iter_{int(iteration):05d}.npz"), **arrays)
+
     def log_step(self, iteration, stats, extra=None):
         if not self.enabled:
             self._reset_interval()

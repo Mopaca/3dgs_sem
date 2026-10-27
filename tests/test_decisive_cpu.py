@@ -118,7 +118,8 @@ def random_step_inputs(n, seed):
         "denom": count.clone(),
         "sim_score_accum": score * count,
         "sim_view_count": count,
-        "sim_radius_accum": torch.rand((n, 1), generator=g) * 40 * count,
+        "sim_diag_accum": torch.cat([torch.rand((n, 1), generator=g) * 40, torch.rand((n, 1), generator=g) * 0.3 + 0.7,
+                                     score], dim=1) * count,
         "max_radii2D": torch.rand((n,), generator=g) * 40,
         "radii": (torch.rand((n,), generator=g) * 40).int(),
     }
@@ -130,8 +131,8 @@ def apply_inputs(m, inp):
     m.sim_score_accum = inp["sim_score_accum"].clone()
     m.sim_view_count = inp["sim_view_count"].clone()
     m.max_radii2D = inp["max_radii2D"].clone()
-    if hasattr(m, "sim_radius_accum") and m.sim_radius_accum.numel() == m.sim_view_count.numel():
-        m.sim_radius_accum = inp["sim_radius_accum"].clone()
+    if hasattr(m, "sim_diag_accum") and m._diag_ready(m.sim_view_count.shape[0]):
+        m.sim_diag_accum = inp["sim_diag_accum"].clone()
 
 
 def model_state(m):
@@ -175,7 +176,7 @@ def test_full_step_equivalence():
             same = all(so[k].shape == sn[k].shape and torch.equal(so[k], sn[k]) for k in so)
             check(same, f"step {step}: identical Gaussians after densify+prune "
                         f"(N {n} -> {new.get_xyz.shape[0]}, collect_stats={collect})")
-            check(new.sim_radius_accum.shape[0] == new.get_xyz.shape[0], f"step {step}: sim_radius_accum length tracks N")
+            check(new.sim_diag_accum.shape == (new.get_xyz.shape[0], 3), f"step {step}: sim_diag_accum shape tracks N")
             if collect:
                 check(stats is not None and stats["n_union"] == stats["n_grad"] + stats["n_sem"] - stats["n_inter"],
                       f"step {step}: stats consistent (n_sem={stats['n_sem']}, n_sem_only={stats['n_sem_only']}, "
@@ -194,7 +195,7 @@ def test_full_step_equivalence():
         st = m.densify_and_prune_by_similarity(2e-4, 0.005, 2.0, 20, inp["radii"], 3100, model_path=None,
                                                sem_cfg=dict(cfg, collect_stats=True))
         ok = all(t.shape[0] == m.get_xyz.shape[0] for t in
-                 [m.sim_score_accum, m.sim_view_count, m.similarity_score, m.sim_radius_accum, m._similarity_aux])
+                 [m.sim_score_accum, m.sim_view_count, m.similarity_score, m.sim_diag_accum, m._similarity_aux])
         check(ok, f"{cfg}: runs, n_sem={st['n_sem']}, state lengths consistent")
 
 
@@ -204,7 +205,7 @@ def test_accumulate():
         mod = cpu_module(f.read(), "gaussian_model_acc")
     m = mod.GaussianModel(3)
     n = 50
-    m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1)); m.sim_radius_accum = torch.zeros((n, 1))
+    m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1)); m.sim_diag_accum = torch.zeros((n, 3))
     ref_acc = torch.zeros((n, 1)); ref_cnt = torch.zeros((n, 1))
     g = torch.Generator().manual_seed(0)
     views = [(torch.rand((n, 1), generator=g), (torch.rand((n, 1), generator=g) > 0.3).float()) for _ in range(7)]
@@ -290,6 +291,69 @@ def test_resolve_config():
             check(True, f"rejects {bad}")
 
 
+def test_scale_weight_analysis():
+    print("[7] scale-weight diagnostics and plots")
+    import tempfile
+    from utils.scale_weight_stats import scale_weight_analysis, format_summary
+    from utils.sem_logger import SemLogger
+    with open(os.path.join(ROOT, "scene", "gaussian_model.py"), encoding="utf-8") as f:
+        mod = cpu_module(f.read(), "gaussian_model_sw")
+    m = make_model(mod, n=6000, seed=1)
+    n = m.get_xyz.shape[0]
+    g = torch.Generator().manual_seed(5)
+    base = (0.87 + 0.03 * torch.randn((n, 1), generator=g)).clamp(0, 1)                 # similarity concentrated near 0.87
+    radius_true = -6.0 * torch.log(torch.rand((n, 1), generator=g).clamp_min(1e-6))  # px, mostly small, few >= 20px
+    for _ in range(6):                                                   # 6 views, all valid
+        radii = (radius_true + torch.randn((n, 1), generator=g)).clamp_min(0)
+        view = (base + 0.01 * torch.randn((n, 1), generator=g)).clamp(-1, 1)
+        rnorm = ((radii - 1.0) / 19.0).clamp(0, 1)
+        weight = 1.0 - 0.3 * rnorm
+        m.accumulate_similarity((view * weight).clamp(0, 1), torch.ones((n, 1)), radius=radii,
+                                scale_weight=weight, raw_score=view.clamp(0, 1))
+    m.finalize_similarity_score()
+    summary, pts = scale_weight_analysis(m, radius_ref=20.0, max_points=3000)
+    print("   ", format_summary(summary))
+    tr = torch.tensor(summary["transition_weighted_x_unweighted"])
+    check(int(tr.sum()) == summary["n_valid"], "transition matrix covers all valid Gaussians")
+    check(list(tr.sum(dim=1)[1:].tolist()) == summary["weighted"]["counts"], "transition rows = weighted interval counts")
+    check(summary["per_interval_weighted"]["G3"]["frac_large"] is not None and
+          summary["per_interval_weighted"]["G3"]["frac_large"] > summary["frac_large_valid"],
+          "synthetic case: large Gaussians are over-represented in weighted G3")
+    check(summary["g3_only_by_scale_weight"] is not None and summary["g3_only_by_scale_weight"] > 0.5,
+          "synthetic case: most weighted-G3 members are there only because of the scale weight")
+    check(pts is not None and len(pts["radius"]) <= 3000 and set(pts) >= {"similarity", "similarity_raw", "radius",
+          "scale_weight", "interval", "interval_raw", "scale_ratio", "grad"}, "points subsampled with all fields")
+
+    # train_sim_rendersim.save_similarity_scale_statistics_json, extracted without importing CUDA modules
+    with open(os.path.join(ROOT, "train_sim_rendersim.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    fn = [nd for nd in tree.body if isinstance(nd, ast.FunctionDef) and nd.name == "save_similarity_scale_statistics_json"]
+    ns = {"os": os, "json": json, "scale_weight_analysis": scale_weight_analysis, "format_summary": format_summary}
+    exec(compile(ast.Module(body=fn, type_ignores=[]), "rendersim_subset", "exec"), ns)
+    import similarity_scale_scatter as sss
+    with tempfile.TemporaryDirectory() as d:
+        ns["save_similarity_scale_statistics_json"](SimpleNamespace(model_path=d), m, 7000, max_points=3000)
+        ns["save_similarity_scale_statistics_json"](SimpleNamespace(model_path=d), m, 7000, max_points=3000)  # same iteration replaced
+        data = json.load(open(os.path.join(d, "similarity_scale_statistics.json")))
+        check(len(data) == 1 and len(data[0]["points"]) <= 3000 and "radius" in data[0]["points"][0],
+              "rendersim json: one record per iteration, new fields present")
+        sss.plot_similarity_scale_scatter(d)
+        files = sorted(os.listdir(os.path.join(d, "similarity_scale_scatter")))
+        check({"007000_radius.png", "007000_raw_vs_weighted.png", "007000_radius_hist.png",
+               "007000_scale_ratio.png", "summary.txt"} <= set(files), f"plots from json: {files}")
+        keep = os.environ.get("KEEP_PLOTS")
+        if keep:
+            import shutil
+            shutil.copytree(os.path.join(d, "similarity_scale_scatter"), keep, dirs_exist_ok=True)
+    with tempfile.TemporaryDirectory() as d:  # train_sim.py path: npz snapshot + sem_log.jsonl summary
+        lg = SemLogger(d, enabled=True)
+        lg.save_arrays("scale_weight", 3000, pts)
+        lg.log_step(3000, {"n_sem": 1}, extra={"scale_weight": summary})
+        sss.plot_similarity_scale_scatter(d)
+        files = sorted(os.listdir(os.path.join(d, "similarity_scale_scatter")))
+        check("003000_raw_vs_weighted.png" in files, "plots from train_sim snapshots + sem_log summary")
+
+
 if __name__ == "__main__":
     torch.set_num_threads(4)
     test_full_step_equivalence()
@@ -297,5 +361,6 @@ if __name__ == "__main__":
     test_controls_and_r9()
     test_maps()
     test_resolve_config()
+    test_scale_weight_analysis()
     print("\nALL CHECKS PASSED" if not FAILED else f"\n{len(FAILED)} CHECK(S) FAILED")
     sys.exit(1 if FAILED else 0)

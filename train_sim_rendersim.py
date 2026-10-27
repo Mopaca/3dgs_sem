@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import json
 from utils.sh_utils import eval_sh
+from utils.scale_weight_stats import scale_weight_analysis, format_summary ###
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -182,7 +183,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             visible_mask = view_visible_mask * (den_grad > 1e-6)
             # visible_mask = visible_mask * wma_weight
 
-            gaussians.accumulate_similarity(weighted_view_score, visible_mask)
+            gaussians.accumulate_similarity(weighted_view_score, visible_mask,
+                                            radius=radii.detach().float().unsqueeze(1),
+                                            scale_weight=scale_weight,
+                                            raw_score=view_score.clamp(0.0, 1.0)) ### diagnostics for save_similarity_scale_statistics_json
             # gaussians.accumulate_similarity(view_score, visible_mask)
             # save_similarity_statistics_json(scene, gaussians, iteration, weighted_view_score, visible_mask)
 
@@ -1401,43 +1405,48 @@ def save_similarity_scale_statistics_json(
     scene,
     gaussians,
     iteration,
+    radius_ref=20.0,
+    max_points=100_000,
 ):
     """
-    Save similarity score and scale ratio statistics.
+    Save similarity score / projected radius / scale weight statistics (review item 4).
 
-    statistics.json
+    Call after gaussians.finalize_similarity_score() and before densification, so that the
+    accumulators still describe the interval that the selection uses.
 
-    Each iteration stores:
+    similarity_scale_statistics.json is a list of
     {
         iteration,
-        similarity_score[],
-        scale_ratio[]
+        summary: {...},   # interval counts with / without the scale weight, transition matrix,
+                          # fraction of large Gaussians per interval, "G3 only by scale weight", ...
+        points: [         # strided subsample (max_points) of the valid Gaussians
+            {
+                similarity,      # S_k used for the selection (with scale weight)
+                similarity_raw,  # same views without the scale weight (same [0, 1] clamp)
+                radius,          # mean projected radius over the valid views (px, rasterizer 3-sigma radius)
+                scale_weight,    # mean scale weight over the same views
+                interval,        # 0: >= mean - std, 1..3: G1..G3 from the weighted score
+                interval_raw,    # the same from the unweighted score
+                scale_ratio,     # min / max world scale (kept for the previous plot)
+                grad,            # mean positional gradient of the interval
+            }, ...
+        ]
     }
+    Requires the training loop to pass radius / scale_weight / raw_score to accumulate_similarity.
     """
 
-    similarity = gaussians.get_similarity_score.detach().squeeze(1)
-    valid_mask = gaussians.sim_view_count.detach().squeeze(1) > 0
+    summary, pts = scale_weight_analysis(gaussians, radius_ref=radius_ref, max_points=max_points)
+    if pts is None:
+        print(f"[ITER {iteration}] similarity-scale statistics skipped: {format_summary(summary)}")
+        return
 
-    scaling = gaussians.get_scaling.detach()
-
-    max_scale = scaling.max(dim=1).values
-    min_scale = scaling.min(dim=1).values
-
-    scale_ratio = min_scale / (max_scale + 1e-12)
-
-    similarity = similarity[valid_mask]
-    scale_ratio = scale_ratio[valid_mask]
-
-    points = []
-
-    for sim, ratio in zip(similarity.cpu().tolist(), scale_ratio.cpu().tolist()):
-        points.append({
-            "similarity": sim,
-            "scale_ratio": ratio
-        })
+    keys = list(pts.keys())
+    columns = [pts[k].tolist() for k in keys]
+    points = [dict(zip(keys, values)) for values in zip(*columns)]
 
     stats_entry = {
         "iteration": int(iteration),
+        "summary": summary,
         "points": points
     }
 
@@ -1456,10 +1465,11 @@ def save_similarity_scale_statistics_json(
 
     data.sort(key=lambda x: x["iteration"])
 
+    # compact JSON: with indent=2 a file with 1e5 points per iteration grows several times larger
     with open(json_path, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f)
 
-    print(f"[ITER {iteration}] Saved similarity-scale statistics.")
+    print(f"[ITER {iteration}] Saved similarity-scale statistics: {format_summary(summary)}")
 
 def save_similarity_statistics_json(
     scene,

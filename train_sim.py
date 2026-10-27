@@ -24,6 +24,7 @@ from utils.dino_utils import DinoSimilarity ###
 from utils.percentile_utils import get_priority_top_percent, get_dynamic_priority_top_percent ###
 from utils.signal_maps import GuidanceMaps, SIGNALS ###
 from utils.sem_logger import SemLogger ###
+from utils.scale_weight_stats import scale_weight_analysis ###
 import json ###
 import time ###
 import random ###
@@ -189,6 +190,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 weighted_view_score = (view_score * scale_weight)
                 weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
             else:
+                scale_weight = None
                 weighted_view_score = view_score.clamp_min(0.0)  # [9] has no scale weight
 
             step = (iteration -1) % 100
@@ -204,7 +206,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # visible_mask = visible_mask * wma_weight
 
             gaussians.accumulate_similarity(weighted_view_score, visible_mask, agg=sem_cfg["view_agg"],
-                                            radius=radii.detach().float().unsqueeze(1))
+                                            radius=radii.detach().float().unsqueeze(1),
+                                            scale_weight=scale_weight,
+                                            raw_score=(view_score.clamp(0.0, 1.0) if sem_cfg["mode"] == "ours" else None))
 
             if sem_logger.enabled:
                 shadow_view_score = None
@@ -276,11 +280,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.finalize_similarity_score(agg=sem_cfg["view_agg"]) ###
                     step_cfg = dict(sem_cfg["densify"]) ###
                     step_cfg["want_snapshot"] = sem_logger.wants_snapshot(iteration) ###
+                    sw_summary = None ###
+                    if sem_logger.enabled and sem_cfg["mode"] == "ours": ### scale-weight diagnostics (review item 4), before densification
+                        sw_summary, sw_points = scale_weight_analysis(gaussians, radius_ref=opt.sem_radius_max)
+                        if sw_points is not None and step_cfg["want_snapshot"]:
+                            sem_logger.save_arrays("scale_weight", iteration, sw_points)
                     step_stats = gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path, sem_cfg=step_cfg)
                     # opacity reset runs after densification in the same iteration, so the last reset before this step is:
                     last_reset = ((iteration - 1) // opt.opacity_reset_interval) * opt.opacity_reset_interval ###
                     sem_logger.log_step(iteration, step_stats, extra={ ###
-                        "iters_since_opacity_reset": (iteration - last_reset) if last_reset > 0 else None}) ###
+                        "iters_since_opacity_reset": (iteration - last_reset) if last_reset > 0 else None, ###
+                        "scale_weight": sw_summary}) ###
                     gaussians.reset_similarity_accum() ###
                     gaussians.reset_similarity_aux() ###
                 ###

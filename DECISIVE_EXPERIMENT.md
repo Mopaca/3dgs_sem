@@ -52,3 +52,12 @@ python collect_results.py --root output/decisive
 `--sem_signal dino|ssim|l1|l1_blur`, `--sem_mode ours|r9`, `--sem_select stratified|random_matched|radius_matched`, `--sem_view_norm auto|mean|sum`, `--sem_view_agg auto|mean|min|max`, `--sem_lambda_scale`, `--sem_radius_min`, `--sem_radius_max`, `--sem_sample_ratio`, `--sem_r9_threshold`, `--sem_r9_cap`, `--sem_blur_sigma`, `--sem_shadow`, `--sem_split adc|mask2`, `--sem_log`, 그리고 `train_sim.py`의 `--seed` (0이면 기존과 같은 고정 seed).
 
 기본값(dino, ours, stratified, adc, shadow 없음)에서는 기존 계산과 같다. ours 모드에서 가중 합(`--sem_view_norm sum`)은 막아 두었다. goodness 점수를 합하면 넓게 덮는 가우시안일수록 잘 복원된 것으로 판정되기 때문이며, 가중 합 비교는 오차 점수를 쓰는 r9 모드에서 한다.
+
+## scale weight 진단 (리뷰 4순위)
+
+scale weight가 큰 가우시안을 G₃로 밀어 넣는지 보기 위해, 각 가우시안에 대해 유효 view 동안의 투영 반지름, scale weight, scale weight를 적용하기 전 점수를 함께 누적한다(`sim_diag_accum`). 투영 반지름은 rasterizer가 투영된 2D 공분산의 최대 고윳값으로 계산하는 3σ 반지름(px)으로, scale weight가 정규화하는 바로 그 값이다. 기존 `scale_ratio`(3D scale의 최소/최대 축 비)는 모양의 길쭉함을 나타낼 뿐 화면에서의 크기와는 다르다.
+
+- `train_sim.py --sem_log`: 매 densification 단계의 `sem_log.jsonl`에 `scale_weight` 요약(가중 전후 구간 개수, 전이 행렬, 구간별 R_max 이상 비율, "scale weight 때문에만 G₃인 비율")을 기록하고, 스냅샷 시점에는 `sem_snapshots/scale_weight_iter_*.npz`를 저장한다.
+- `train_sim_rendersim.py`의 `save_similarity_scale_statistics_json`: 같은 정보를 `similarity_scale_statistics.json`에 기록한다(최대 10만 개 표본, 기존 `similarity`·`scale_ratio` 필드 유지).
+- `python similarity_scale_scatter.py <model_path>`: 두 입력 중 있는 쪽을 읽어 similarity–반지름 산점도, 가중 전–후 점수 산점도, 반지름 분포, 기존 scale ratio 산점도와 `summary.txt`를 만든다.
+
