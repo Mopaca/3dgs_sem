@@ -22,6 +22,13 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from utils.dino_utils import DinoSimilarity ###
 from utils.percentile_utils import get_priority_top_percent, get_dynamic_priority_top_percent ###
+from utils.signal_maps import GuidanceMaps, SIGNALS ###
+from utils.sem_logger import SemLogger ###
+import json ###
+import time ###
+import random ###
+import subprocess ###
+import numpy as np ###
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import torchvision.utils as vutils
@@ -45,17 +52,22 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, run_info=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+
+    sem_cfg = resolve_sem_config(opt) ###
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
-    dino_sim = DinoSimilarity(model_name="dinov2_vits14", device="cuda")
+    # Created at the same point as the previous DinoSimilarity, so a dino run consumes the RNG identically.
+    guidance = GuidanceMaps([sem_cfg["signal"], sem_cfg["shadow"]], device="cuda", blur_sigma=opt.sem_blur_sigma) ###
     gaussians.training_setup(opt)
+    sem_logger = SemLogger(scene.model_path, enabled=opt.sem_log) ###
+    save_run_config(scene.model_path, dataset, opt, pipe, sem_cfg, run_info) ###
     priority_cutoff = None
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -76,6 +88,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+
+    torch.cuda.reset_peak_memory_stats() ###
+    t_train_start = time.time() ###
+    t_densify_end = None ###
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -134,9 +150,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if do_similarity:
             with torch.no_grad():
                 gt_image = viewpoint_cam.original_image.cuda()
-                img_bchw = image.unsqueeze(0)
-                gt_bchw = gt_image.unsqueeze(0)
-                sim_map = dino_sim.cosine_map(img_bchw, gt_bchw).squeeze(0).detach()
+                # [1, H, W] goodness map (dino: same as the previous cosine_map call)
+                sim_map = guidance.goodness(sem_cfg["signal"], image, gt_image)
+                shadow_map = None
+                if sem_cfg["shadow"] != "none":
+                    shadow_map = guidance.goodness(sem_cfg["shadow"], image, gt_image)
+                if sem_cfg["mode"] == "r9":
+                    # [9]-style: back-project an error map instead of a goodness map
+                    sim_map = 1.0 - sim_map
+                    if shadow_map is not None:
+                        shadow_map = 1.0 - shadow_map
 
             if scalar_map.dim() == 4:
                 scalar_map = scalar_map.squeeze(0)
@@ -146,17 +169,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             aux_loss_num = (sim_map * scalar_map[0:1]).sum()
             aux_den = (torch.ones_like(scalar_map[1:2]) * scalar_map[1:2]).sum()
             aux_loss = aux_loss_num + aux_den
+            if shadow_map is not None:
+                # 3rd aux channel (otherwise unused): numerator of the shadow signal, same backward pass
+                aux_loss = aux_loss + (shadow_map * scalar_map[2:3]).sum()
 
             aux_grad = torch.autograd.grad(outputs=aux_loss, inputs=gaussians.get_similarity_aux, retain_graph=True, create_graph=False, allow_unused=False)[0]
             num_grad = aux_grad[:, 0:1].detach()
             den_grad = aux_grad[:, 1:2].detach()
 
-            view_score = num_grad / (den_grad + 1e-8)
-            normalized_radius = normalize_projected_radius(radii=radii, min_radius=1.0, max_radius=20.0)
-            lambda_scale = 0.3
-            scale_weight = (1.0 - lambda_scale * normalized_radius)
-            weighted_view_score = (view_score * scale_weight)
-            weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
+            if sem_cfg["view_norm"] == "mean":
+                view_score = num_grad / (den_grad + 1e-8)     # contribution-weighted mean (proposed)
+            else:
+                view_score = num_grad                          # contribution-weighted sum ([9])
+
+            if sem_cfg["mode"] == "ours":
+                normalized_radius = normalize_projected_radius(radii=radii, min_radius=opt.sem_radius_min, max_radius=opt.sem_radius_max)
+                lambda_scale = opt.sem_lambda_scale
+                scale_weight = (1.0 - lambda_scale * normalized_radius)
+                weighted_view_score = (view_score * scale_weight)
+                weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
+            else:
+                weighted_view_score = view_score.clamp_min(0.0)  # [9] has no scale weight
 
             step = (iteration -1) % 100
             progress = step / 99.0
@@ -166,15 +199,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             view_visible_mask = visibility_filter.float()
             if view_visible_mask.dim() == 1:
                 view_visible_mask = view_visible_mask.unsqueeze(1)
-            
+
             visible_mask = view_visible_mask * (den_grad > 1e-6)
             # visible_mask = visible_mask * wma_weight
 
-            gaussians.accumulate_similarity(weighted_view_score, visible_mask)
+            gaussians.accumulate_similarity(weighted_view_score, visible_mask, agg=sem_cfg["view_agg"],
+                                            radius=radii.detach().float().unsqueeze(1))
+
+            if sem_logger.enabled:
+                shadow_view_score = None
+                if shadow_map is not None:
+                    shadow_num = aux_grad[:, 2:3].detach()
+                    shadow_view_score = shadow_num / (den_grad + 1e-8) if sem_cfg["view_norm"] == "mean" else shadow_num
+                sem_logger.observe_view(iteration, view_score, visible_mask, shadow_view_score)
 
         if iteration == opt.densify_until_iter:
-            del dino_sim
-            torch.cuda.empty_cache()
+            guidance.release()
+            t_densify_end = time.time()
 #####
 
         # Loss
@@ -232,8 +273,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ###
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.finalize_similarity_score() ###
-                    gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path)
+                    gaussians.finalize_similarity_score(agg=sem_cfg["view_agg"]) ###
+                    step_cfg = dict(sem_cfg["densify"]) ###
+                    step_cfg["want_snapshot"] = sem_logger.wants_snapshot(iteration) ###
+                    step_stats = gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path, sem_cfg=step_cfg)
+                    # opacity reset runs after densification in the same iteration, so the last reset before this step is:
+                    last_reset = ((iteration - 1) // opt.opacity_reset_interval) * opt.opacity_reset_interval ###
+                    sem_logger.log_step(iteration, step_stats, extra={ ###
+                        "iters_since_opacity_reset": (iteration - last_reset) if last_reset > 0 else None}) ###
                     gaussians.reset_similarity_accum() ###
                     gaussians.reset_similarity_aux() ###
                 ###
@@ -259,6 +306,107 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         if do_similarity: ###
             gaussians.reset_similarity_aux() ###
+
+    write_train_stats(scene.model_path, gaussians, opt, t_train_start, t_densify_end) ###
+
+###
+SEM_MODES = ("ours", "r9")
+SEM_SELECTS = ("stratified", "random_matched", "radius_matched")
+SEM_SPLITS = ("adc", "mask2")
+
+
+def resolve_sem_config(opt):
+    """Validate the sem_* options and resolve the 'auto' aggregation settings."""
+    mode = opt.sem_mode
+    if mode not in SEM_MODES:
+        raise ValueError(f"--sem_mode must be one of {SEM_MODES}, got '{mode}'")
+    if opt.sem_signal not in SIGNALS:
+        raise ValueError(f"--sem_signal must be one of {SIGNALS}, got '{opt.sem_signal}'")
+    if opt.sem_shadow != "none" and opt.sem_shadow not in SIGNALS:
+        raise ValueError(f"--sem_shadow must be 'none' or one of {SIGNALS}, got '{opt.sem_shadow}'")
+    if opt.sem_select not in SEM_SELECTS:
+        raise ValueError(f"--sem_select must be one of {SEM_SELECTS}, got '{opt.sem_select}'")
+    if opt.sem_split not in SEM_SPLITS:
+        raise ValueError(f"--sem_split must be one of {SEM_SPLITS}, got '{opt.sem_split}'")
+
+    view_norm = opt.sem_view_norm if opt.sem_view_norm != "auto" else ("mean" if mode == "ours" else "sum")
+    view_agg = opt.sem_view_agg if opt.sem_view_agg != "auto" else ("mean" if mode == "ours" else "max")
+    if view_norm not in ("mean", "sum"):
+        raise ValueError(f"--sem_view_norm must be auto|mean|sum, got '{opt.sem_view_norm}'")
+
+    if mode == "ours":
+        # A summed goodness score grows with coverage, i.e. large Gaussians would look "well reconstructed".
+        if view_norm != "mean":
+            raise ValueError("ours mode uses a goodness score; within-view 'sum' is only meaningful for an error score (use --sem_mode r9)")
+        if view_agg not in ("mean", "min"):
+            raise ValueError("ours mode supports --sem_view_agg mean|min (min = worst view of a goodness score)")
+    else:
+        if view_agg not in ("mean", "max"):
+            raise ValueError("r9 mode supports --sem_view_agg mean|max (max = worst view of an error score)")
+        if opt.sem_select != "stratified":
+            raise ValueError("--sem_select applies to ours mode only; r9 mode uses the threshold + cap rule")
+        if opt.sem_lambda_scale != 0.0:
+            print(f"[sem] r9 mode: scale weight is not used (sem_lambda_scale={opt.sem_lambda_scale} ignored)")
+
+    densify_cfg = {
+        "mode": mode,
+        "select": opt.sem_select,
+        "sample_ratio": opt.sem_sample_ratio,
+        "r9_threshold": opt.sem_r9_threshold,
+        "r9_cap": opt.sem_r9_cap,
+        "split": opt.sem_split,
+        "radius_ref": opt.sem_radius_max,
+        "collect_stats": bool(opt.sem_log),
+    }
+    cfg = {"mode": mode, "signal": opt.sem_signal, "shadow": opt.sem_shadow,
+           "view_norm": view_norm, "view_agg": view_agg, "densify": densify_cfg}
+    print(f"[sem] config: {json.dumps(cfg)}")
+    return cfg
+
+
+def _git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
+                                       stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return None
+
+
+def save_run_config(model_path, dataset, opt, pipe, sem_cfg, run_info):
+    """cfg_args only stores ModelParams, so the full option set is written here."""
+    record = {
+        "dataset": vars(dataset),
+        "opt": vars(opt),
+        "pipe": vars(pipe),
+        "sem_resolved": sem_cfg,
+        "run_info": run_info or {},
+        "git_commit": _git_commit(),
+    }
+    with open(os.path.join(model_path, "sem_run_config.json"), "w") as f:
+        json.dump(record, f, indent=2, default=str)
+
+
+def write_train_stats(model_path, gaussians, opt, t_train_start, t_densify_end):
+    t_end = time.time()
+    stats = {
+        "wall_time_min": (t_end - t_train_start) / 60.0,
+        "densify_phase_min": ((t_densify_end - t_train_start) / 60.0) if t_densify_end else None,
+        "peak_vram_allocated_gb": torch.cuda.max_memory_allocated() / 1024 ** 3,
+        "peak_vram_reserved_gb": torch.cuda.max_memory_reserved() / 1024 ** 3,
+        "num_gaussians": int(gaussians.get_xyz.shape[0]),
+        "iterations": int(opt.iterations),
+        "note": "wall time includes any test evaluation and saving done during training",
+    }
+    with open(os.path.join(model_path, "train_stats.json"), "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"[sem] train stats: {json.dumps(stats)}")
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 ###
 def normalize_projected_radius(
@@ -361,19 +509,22 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--seed", type=int, default=0) ### seed 0 reproduces the previous fixed-seed behaviour
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
+
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
+    set_seed(args.seed) ### safe_state always seeds 0; re-seed here (nothing consumes the RNG in between)
 
     # Start GUI server, configure and run training
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    run_info = {"seed": args.seed, "argv": sys.argv} ###
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, run_info=run_info)
 
     # All done
     print("\nTraining complete.")

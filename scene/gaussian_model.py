@@ -23,6 +23,23 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 import json ###
 import os ###
+from utils.sem_select import (select_stratified, select_random_matched, select_radius_matched,
+                              select_threshold_cap, summarize, strided_subsample) ###
+
+# Default semantic densification config used when densify_and_prune_by_similarity is called
+# without sem_cfg (e.g. train_sim_rendersim.py). It reproduces the behaviour of commit 343c470.
+DEFAULT_SEM_CFG = {
+    "mode": "ours",            # ours | r9
+    "select": "stratified",    # stratified | random_matched | radius_matched  (ours mode)
+    "sample_ratio": 0.2,       # rho (343c470 value; train_sim.py passes opt.sem_sample_ratio)
+    "r9_threshold": 0.1,
+    "r9_cap": 0.05,
+    "split": "adc",            # adc | mask2
+    "radius_ref": 20.0,        # R_max, used for the "fraction >= R_max" statistic
+    "collect_stats": False,
+    "want_snapshot": False,
+    "snapshot_max_points": 200_000,
+} ###
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -70,6 +87,7 @@ class GaussianModel:
         self.sim_score_accum = torch.empty(0) ###
         self.sim_view_count = torch.empty(0) ###
         self.similarity_score = torch.empty(0) ###
+        self.sim_radius_accum = torch.empty(0) ### sum of projected radius over valid views (logging, radius control)
 
     def capture(self):
         return (
@@ -234,6 +252,7 @@ class GaussianModel:
         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+        self.sim_radius_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -320,6 +339,8 @@ class GaussianModel:
         self.sim_score_accum.zero_()
         self.sim_view_count.zero_()
         self.similarity_score.zero_()
+        if self.sim_radius_accum.numel() == self.sim_view_count.numel():
+            self.sim_radius_accum.zero_()
     
     def reset_similarity_aux(self):
         with torch.no_grad():
@@ -383,21 +404,50 @@ class GaussianModel:
         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+        self.sim_radius_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
 
         self.active_sh_degree = self.max_sh_degree
 
 #####
-    def accumulate_similarity(self, view_score, visible_mask):
-        self.sim_score_accum += view_score * visible_mask
+    def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None):
+        """
+        view_score:   [N, 1] weighted view score of the current view
+        visible_mask: [N, 1] float, 1 for valid views (visible and contribution sum > tau_v)
+        agg:          "mean" (proposed; identical to the previous implementation),
+                      "min" (worst view of a goodness score), "max" (worst view of an error score, [9])
+        radius:       [N, 1] projected radius of the current view (optional, for logging / radius control)
+        """
+        if agg == "mean":
+            self.sim_score_accum += view_score * visible_mask
+        elif agg in ("min", "max"):
+            seen = self.sim_view_count > 0
+            reduce_op = torch.minimum if agg == "min" else torch.maximum
+            candidate = torch.where(seen, reduce_op(self.sim_score_accum, view_score), view_score)
+            self.sim_score_accum = torch.where(visible_mask > 0, candidate, self.sim_score_accum)
+        else:
+            raise ValueError(f"Unknown view aggregation: {agg}")
         self.sim_view_count += visible_mask
+        if radius is not None and self.sim_radius_accum.numel() == self.sim_view_count.numel():
+            self.sim_radius_accum += radius * visible_mask
         # self.sim_score_accum += view_score
 
-    def finalize_similarity_score(self, eps=1e-8):
-        self.similarity_score = self.sim_score_accum / (self.sim_view_count)
+    def finalize_similarity_score(self, eps=1e-8, agg="mean"):
+        if agg == "mean":
+            self.similarity_score = self.sim_score_accum / (self.sim_view_count)
+        else:
+            self.similarity_score = torch.where(self.sim_view_count > 0, self.sim_score_accum,
+                                                torch.zeros_like(self.sim_score_accum))
         # self.similarity_score = self.sim_score_accum / self.denom
         self.similarity_score[self.similarity_score.isnan()] = 0.0
         self.similarity_score[self.similarity_score.isinf()] = 0.0
         return self.similarity_score
+
+    def get_mean_projected_radius(self):
+        """[N] mean projected radius (px) over the valid views of the current interval, 0 if unseen."""
+        count = self.sim_view_count.squeeze(1)
+        if self.sim_radius_accum.numel() != count.numel():
+            return torch.zeros_like(count)
+        return self.sim_radius_accum.squeeze(1) / count.clamp_min(1.0)
 #####
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -644,6 +694,8 @@ class GaussianModel:
         self.sim_score_accum = self.sim_score_accum[valid_points_mask] ###
         self.sim_view_count = self.sim_view_count[valid_points_mask] ###
         self.similarity_score = self.similarity_score[valid_points_mask] ###
+        if self.sim_radius_accum.numel() == valid_points_mask.numel(): ###
+            self.sim_radius_accum = self.sim_radius_accum[valid_points_mask] ###
         self._similarity_aux = nn.Parameter(self._similarity_aux[valid_points_mask].detach().requires_grad_(True)) ###
 
 
@@ -694,6 +746,8 @@ class GaussianModel:
         self.sim_score_accum = torch.cat([self.sim_score_accum, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
         self.sim_view_count = torch.cat([self.sim_view_count, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
         self.similarity_score = torch.cat([self.similarity_score, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+        if self.sim_radius_accum.numel() == self.sim_score_accum.numel() - new_count: ###
+            self.sim_radius_accum = torch.cat([self.sim_radius_accum, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
         self._similarity_aux = nn.Parameter(torch.cat([self._similarity_aux.detach(), torch.zeros((new_count, 3), device="cuda")], dim=0).requires_grad_(True)) ###
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
@@ -1625,8 +1679,24 @@ class GaussianModel:
 
         return semantic_densify_mask
     
-    def densify_and_prune_by_similarity(self, max_grad, min_opacity, extent, max_screen_size, radii, iteration, model_path):
-        
+    def densify_and_prune_by_similarity(self, max_grad, min_opacity, extent, max_screen_size, radii, iteration, model_path, sem_cfg=None):
+        """
+        Union of the gradient set and the semantic set, then the original ADC clone / split / prune.
+
+        sem_cfg (dict, optional; missing keys fall back to DEFAULT_SEM_CFG):
+            mode         "ours": goodness score, selection by `select`
+                         "r9"  : error score, [9]-style threshold + per-step cap
+            select       "stratified" (proposed) | "random_matched" | "radius_matched"
+            sample_ratio rho of the stratified sampling
+            split        "adc" (densify_and_split_by_selected_mask) | "mask2" (principal-axis split, under review)
+        Returns a statistics dict when sem_cfg["collect_stats"] is True, otherwise None.
+        With mode="ours", select="stratified", split="adc" the operations (including the order of
+        random-number calls) are the same as the previous implementation.
+        """
+        cfg = dict(DEFAULT_SEM_CFG)
+        if sem_cfg:
+            cfg.update(sem_cfg)
+
         grads = self.xyz_gradient_accum / (self.denom + 1e-8)
         grads[torch.isnan(grads)] = 0.0
         grads[torch.isinf(grads)] = 0.0
@@ -1641,13 +1711,42 @@ class GaussianModel:
         sim_score = self.get_similarity_score.squeeze(1).detach()
         sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >= 0))
 
-        semantic_densify_mask = self.build_semantic_densify_mask(sim_score, sim_valid_mask, iteration, global_sample_ratio=0.2)
+        select_info = {}
+        if cfg["mode"] == "ours":
+            if cfg["select"] == "stratified":
+                semantic_densify_mask, plan = select_stratified(sim_score, sim_valid_mask, cfg["sample_ratio"])
+            elif cfg["select"] == "random_matched":
+                semantic_densify_mask, plan = select_random_matched(sim_score, sim_valid_mask, cfg["sample_ratio"])
+            elif cfg["select"] == "radius_matched":
+                semantic_densify_mask, plan = select_radius_matched(sim_score, sim_valid_mask, cfg["sample_ratio"],
+                                                                    self.get_mean_projected_radius())
+            else:
+                raise ValueError(f"Unknown semantic selection: {cfg['select']}")
+            select_info = {"score_mean": plan["mean"], "score_std": plan["std"],
+                           "interval_counts": plan["counts"], "interval_samples": plan["num_samples"]}
+        elif cfg["mode"] == "r9":
+            semantic_densify_mask, info = select_threshold_cap(sim_score, sim_valid_mask, cfg["r9_threshold"], cfg["r9_cap"])
+            select_info = {"r9_" + k: v for k, v in info.items()}
+        else:
+            raise ValueError(f"Unknown semantic mode: {cfg['mode']}")
+
         selected_pts_mask_old = grad_mask | semantic_densify_mask
+
+        stats = None
+        if cfg["collect_stats"]:
+            stats = self._semantic_step_stats(grad_mag, grad_mask, sim_score, sim_valid_mask,
+                                              semantic_densify_mask, extent, max_grad, cfg)
+            stats.update(select_info)
 
         self.tmp_radii = radii
 
         self.densify_and_clone_by_selected_mask(selected_pts_mask_old, extent)
-        self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)
+        if cfg["split"] == "adc":
+            self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)
+        elif cfg["split"] == "mask2":
+            self.densify_and_split_by_selected_mask2(gradient_mask_old=grad_mask, semantic_mask_old=semantic_densify_mask, scene_extent=extent, N=2, semantic_offset_ratio=0.75, semantic_minor_scale_ratio=0.8)
+        else:
+            raise ValueError(f"Unknown split mode: {cfg['split']}")
         # self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
         # if iteration < 9000:
         #     self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
@@ -1670,5 +1769,59 @@ class GaussianModel:
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
-    
+
+        if stats is not None:
+            stats["n_after"] = int(self.get_xyz.shape[0])
+            stats["n_pruned"] = int(prune_mask.sum().item())
+        return stats
+
+    @torch.no_grad()
+    def _semantic_step_stats(self, grad_mag, grad_mask, sim_score, sim_valid_mask, semantic_mask, extent, max_grad, cfg):
+        """Statistics of one densification step, computed before clone / split (indices = current Gaussians)."""
+        radius_ref = float(cfg["radius_ref"])
+        sem = semantic_mask
+        sem_only = sem & ~grad_mask
+        union = sem | grad_mask
+        small = torch.max(self.get_scaling, dim=1).values <= self.percent_dense * extent
+        radius_mean = self.get_mean_projected_radius()
+
+        n_sem = int(sem.sum().item())
+        stats = {
+            "n_total": int(sim_score.numel()),
+            "n_valid": int(sim_valid_mask.sum().item()),
+            "n_grad": int(grad_mask.sum().item()),
+            "n_sem": n_sem,
+            "n_inter": int((sem & grad_mask).sum().item()),
+            "n_sem_only": int(sem_only.sum().item()),
+            "n_union": int(union.sum().item()),
+            "n_clone_union": int((union & small).sum().item()),
+            "n_split_union": int((union & ~small).sum().item()),
+            "n_clone_sem_only": int((sem_only & small).sum().item()),
+            "n_split_sem_only": int((sem_only & ~small).sum().item()),
+            # fraction of M_sem whose mean positional gradient is below tau_g (review item 5)
+            "sem_frac_grad_below_tau": ((grad_mag[sem] < max_grad).float().mean().item() if n_sem > 0 else None),
+            "radius_valid": summarize(radius_mean, sim_valid_mask, ref=radius_ref),
+            "radius_sem": summarize(radius_mean, sem, ref=radius_ref),
+            "radius_sem_only": summarize(radius_mean, sem_only, ref=radius_ref),
+            "score_valid": summarize(sim_score, sim_valid_mask),
+            "score_sem": summarize(sim_score, sem),
+            "grad_sem": summarize(grad_mag, sem),
+            "grad_valid": summarize(grad_mag, sim_valid_mask),
+        }
+
+        if cfg.get("want_snapshot"):
+            idx = strided_subsample(torch.nonzero(sim_valid_mask, as_tuple=False).squeeze(1),
+                                    int(cfg.get("snapshot_max_points", 200_000)))
+            stats["_snapshot"] = {
+                "score": sim_score[idx].float().cpu().numpy(),
+                "grad": grad_mag[idx].float().cpu().numpy(),
+                "radius_mean": radius_mean[idx].float().cpu().numpy(),
+                "view_count": self.sim_view_count.squeeze(1)[idx].float().cpu().numpy(),
+                "is_sem": sem[idx].cpu().numpy(),
+                "is_grad": grad_mask[idx].cpu().numpy(),
+                "is_small": small[idx].cpu().numpy(),
+                "tau_g": float(max_grad),
+            }
+        return stats
+
 #####

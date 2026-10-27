@@ -99,7 +99,23 @@ class OptimizationParams(ParamGroup):
         self.optimizer_type = "default"
         self.sim_start_iter = 3000 ###
         self.sim_interval = 10 ###
-        super().__init__(parser, "Optimization Parameters")  
+        # ---- semantic densification (decisive experiment); defaults = proposed method ----
+        self.sem_signal = "dino"          # guidance map: dino | ssim | l1 | l1_blur
+        self.sem_mode = "ours"            # ours (goodness, scale weight, stratified) | r9 ([9]-style error rule)
+        self.sem_select = "stratified"    # ours mode: stratified | random_matched | radius_matched
+        self.sem_view_norm = "auto"       # within-view aggregation: auto | mean | sum   (auto: ours=mean, r9=sum)
+        self.sem_view_agg = "auto"        # across-view aggregation: auto | mean | min | max (auto: ours=mean, r9=max)
+        self.sem_lambda_scale = 0.3       # lambda_s of the scale weight (0 disables it)
+        self.sem_radius_min = 1.0         # R_min (px)
+        self.sem_radius_max = 20.0        # R_max (px)
+        self.sem_sample_ratio = 0.3       # rho of the stratified sampling
+        self.sem_r9_threshold = 0.1       # r9 mode: error threshold
+        self.sem_r9_cap = 0.05            # r9 mode: max fraction of Gaussians added per step
+        self.sem_blur_sigma = 4.0         # l1_blur: Gaussian blur sigma (px)
+        self.sem_shadow = "none"          # extra signal back-projected through the 3rd aux channel (logging only)
+        self.sem_split = "adc"            # adc (densify_and_split_by_selected_mask) | mask2
+        self.sem_log = False              # write sem_log.jsonl / sem_snapshots
+        super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
