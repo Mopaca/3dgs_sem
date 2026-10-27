@@ -1641,12 +1641,13 @@ class GaussianModel:
         sim_score = self.get_similarity_score.squeeze(1).detach()
         sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >= 0))
 
-        semantic_densify_mask = self.build_semantic_densify_mask(sim_score, sim_valid_mask, iteration, global_sample_ratio=0.3)
+        semantic_densify_mask = self.build_semantic_densify_mask(sim_score, sim_valid_mask, iteration, global_sample_ratio=0.2)
         selected_pts_mask_old = grad_mask | semantic_densify_mask
 
         self.tmp_radii = radii
 
         self.densify_and_clone_by_selected_mask(selected_pts_mask_old, extent)
+        self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)
         # self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
         # if iteration < 9000:
         #     self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
@@ -1654,7 +1655,7 @@ class GaussianModel:
         #     self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)        
         # self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
 
-        self.densify_and_split_by_selected_mask2(gradient_mask_old=grad_mask, semantic_mask_old=semantic_densify_mask, scene_extent=extent, N=2, semantic_offset_ratio=0.75, semantic_minor_scale_ratio=0.8)
+        # self.densify_and_split_by_selected_mask2(gradient_mask_old=grad_mask, semantic_mask_old=semantic_densify_mask, scene_extent=extent, N=2, semantic_offset_ratio=0.75, semantic_minor_scale_ratio=0.8)
         
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:

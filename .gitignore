@@ -8,3 +8,14 @@ tensorboard_3d
 screenshots
 datasets
 dinov2
+# Datasets and experiment outputs
+/datasets/
+/output/
+/eval/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
