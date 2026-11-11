@@ -186,9 +186,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if sem_cfg["mode"] == "ours":
                 normalized_radius = normalize_projected_radius(radii=radii, min_radius=opt.sem_radius_min, max_radius=opt.sem_radius_max)
                 lambda_scale = opt.sem_lambda_scale
-                scale_weight = (1.0 - lambda_scale * normalized_radius)
-                weighted_view_score = (view_score * scale_weight)
-                weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
+                if opt.sem_scale_mode == "power":
+                    # S~ = S^(1 + lambda_s * R): R=0 -> S, endpoints 0 and 1 fixed for every size
+                    base = view_score.clamp(0.0, 1.0)
+                    weighted_view_score = base.pow(1.0 + lambda_scale * normalized_radius)
+                    # effective multiplier S~/S, used only for the diagnostics (sim_diag_accum)
+                    scale_weight = torch.where(base > 1e-8, weighted_view_score / base.clamp_min(1e-8), torch.ones_like(base))
+                else:
+                    scale_weight = (1.0 - lambda_scale * normalized_radius)
+                    weighted_view_score = (view_score * scale_weight)
+                    weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
             else:
                 scale_weight = None
                 weighted_view_score = view_score.clamp_min(0.0)  # [9] has no scale weight
@@ -291,6 +298,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     sem_logger.log_step(iteration, step_stats, extra={ ###
                         "iters_since_opacity_reset": (iteration - last_reset) if last_reset > 0 else None, ###
                         "scale_weight": sw_summary}) ###
+                    if sem_logger.enabled and iteration % 1000 == 0: ### one console line per 1000 iterations
+                        progress_bar.write(sem_console_line(iteration, step_stats, sw_summary))
                     gaussians.reset_similarity_accum() ###
                     gaussians.reset_similarity_aux() ###
                 ###
@@ -343,6 +352,8 @@ def resolve_sem_config(opt):
     view_agg = opt.sem_view_agg if opt.sem_view_agg != "auto" else ("mean" if mode == "ours" else "max")
     if view_norm not in ("mean", "sum"):
         raise ValueError(f"--sem_view_norm must be auto|mean|sum, got '{opt.sem_view_norm}'")
+    if opt.sem_scale_mode not in ("linear", "power"):
+        raise ValueError(f"--sem_scale_mode must be linear|power, got '{opt.sem_scale_mode}'")
 
     if mode == "ours":
         # A summed goodness score grows with coverage, i.e. large Gaussians would look "well reconstructed".
@@ -369,7 +380,7 @@ def resolve_sem_config(opt):
         "collect_stats": bool(opt.sem_log),
     }
     cfg = {"mode": mode, "signal": opt.sem_signal, "shadow": opt.sem_shadow,
-           "view_norm": view_norm, "view_agg": view_agg, "densify": densify_cfg}
+           "view_norm": view_norm, "view_agg": view_agg, "scale_mode": opt.sem_scale_mode, "densify": densify_cfg}
     print(f"[sem] config: {json.dumps(cfg)}")
     return cfg
 
@@ -410,6 +421,25 @@ def write_train_stats(model_path, gaussians, opt, t_train_start, t_densify_end):
     with open(os.path.join(model_path, "train_stats.json"), "w") as f:
         json.dump(stats, f, indent=2)
     print(f"[sem] train stats: {json.dumps(stats)}")
+
+
+def sem_console_line(iteration, stats, sw_summary):
+    """Short progress line of the semantic selection (printed through tqdm, does not break the bar)."""
+    if not stats:
+        return f"[sem {iteration}] no statistics"
+    parts = [f"N={stats['n_total'] / 1e6:.2f}M", f"grad={stats['n_grad']}",
+             f"sem={stats['n_sem']} (sem-only {stats['n_sem_only']})"]
+    if "interval_counts" in stats:
+        parts.append("G1/G2/G3=" + "/".join(str(c) for c in stats["interval_counts"]) +
+                     " K=" + "/".join(str(k) for k in stats["interval_samples"]))
+    if "r9_n_candidates" in stats:
+        parts.append(f"r9 candidates={stats['r9_n_candidates']} cap={'hit' if stats.get('r9_cap_bound') else 'no'}")
+    frac = (stats.get("radius_sem") or {}).get("frac_ge_ref")
+    if frac is not None:
+        parts.append(f"M_sem r>=R_max {100 * frac:.0f}%")
+    if sw_summary and sw_summary.get("g3_only_by_scale_weight") is not None:
+        parts.append(f"G3 only by scale weight {100 * sw_summary['g3_only_by_scale_weight']:.0f}%")
+    return f"[sem {iteration}] " + " | ".join(parts)
 
 
 def set_seed(seed):

@@ -106,6 +106,7 @@ class OptimizationParams(ParamGroup):
         self.sem_view_norm = "auto"       # within-view aggregation: auto | mean | sum   (auto: ours=mean, r9=sum)
         self.sem_view_agg = "auto"        # across-view aggregation: auto | mean | min | max (auto: ours=mean, r9=max)
         self.sem_lambda_scale = 0.3       # lambda_s of the scale weight (0 disables it)
+        self.sem_scale_mode = "linear"    # linear: S*(1 - lambda_s*R)  |  power: S^(1 + lambda_s*R)
         self.sem_radius_min = 1.0         # R_min (px)
         self.sem_radius_max = 20.0        # R_max (px)
         self.sem_sample_ratio = 0.3       # rho of the stratified sampling

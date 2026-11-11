@@ -27,7 +27,7 @@ M360_DIR=${M360_DIR:-datasets/NeRF360}
 TANDT_DIR=${TANDT_DIR:-datasets/tandt}
 DB_DIR=${DB_DIR:-datasets/db}
 OUT_ROOT=${OUT_ROOT:-output/decisive}
-export TORCH_HOME=${TORCH_HOME:-/workspace/.cache/torch}
+export TORCH_HOME=${TORCH_HOME:-/root/.cache/torch}
 
 # ---------------- fixed hyperparameters ----------------
 # Passed explicitly so that the defaults in arguments/__init__.py do not matter.
@@ -53,7 +53,7 @@ contains() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
 
 scene_source() {   # prints "<source_path> <image_folder>"
     local s=$1
-    if contains "$M360_OUTDOOR" "$s"; then echo "$M360_DIR/$s images_4"
+    if contains "$M360_OUTDOOR" "$s"; then echo "$M360_DIR/$s images_8"
     elif contains "$M360_INDOOR" "$s"; then echo "$M360_DIR/$s images_2"
     elif contains "$TANDT_SCENES" "$s"; then echo "$TANDT_DIR/$s images"
     elif contains "$DB_SCENES" "$s"; then echo "$DB_DIR/$s images"
@@ -71,6 +71,8 @@ arm_flags() {
         l1_l0)          echo "--sem_signal l1 --sem_lambda_scale 0" ;;
         rand_matched)   echo "--sem_signal dino --sem_select random_matched" ;;   # same count, random
         radius_matched) echo "--sem_signal dino --sem_select radius_matched" ;;   # same count, largest radius
+        dino_pow1)      echo "--sem_signal dino --sem_scale_mode power --sem_lambda_scale 1" ;;   # S^(1+R)
+        dino_pow2)      echo "--sem_signal dino --sem_scale_mode power --sem_lambda_scale 2" ;;   # S^(1+2R)
         # ---- 2nd round (optional) ----
         l1blur_l03)     echo "--sem_signal l1_blur" ;;
         dino_viewmin)   echo "--sem_signal dino --sem_view_agg min" ;;              # view mean vs worst view
@@ -92,7 +94,7 @@ for scene in $SCENES; do
         for seed in $SEEDS; do
             out="$OUT_ROOT/$scene/$arm/seed$seed"
             mkdir -p "$out"
-            cmd="python train_sim.py -s $SRC -i $IMG -m $out --seed $seed $COMMON $flags"
+            cmd="python train_sim.py -s $SRC -i images_8 -m $out --seed $seed $COMMON $flags"
             echo "$cmd" > "$out/command.txt"
             echo "============================================================"
             echo "[decisive] $scene / $arm / seed$seed"
