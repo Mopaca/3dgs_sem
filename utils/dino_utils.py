@@ -7,9 +7,12 @@ class DinoSimilarity:
     def __init__(
         self,
         model_name="dinov2_vits14",
-        device="cuda"
+        device="cuda",
+        channel_chunk=0
     ):
         self.device = device
+        # 0: 기존 방식(전체 채널을 한 번에 upsampling), >0: 채널을 이 크기로 나눠 계산(메모리 절약)
+        self.channel_chunk = int(channel_chunk)
 
         self.model = torch.hub.load(
             "dinov2/",
@@ -122,7 +125,8 @@ class DinoSimilarity:
         gt_features,
         output_size,
         mode="bilinear",
-        eps=1e-8
+        eps=1e-8,
+        channel_chunk=0
     ):
         """
         Patch-grid feature를 먼저 원본 해상도로 보간한 뒤
@@ -152,6 +156,24 @@ class DinoSimilarity:
         # nearest 계열에서는 align_corners를 쓰면 안 됨
         if mode in ("linear", "bilinear", "bicubic", "trilinear"):
             interpolate_kwargs["align_corners"] = False
+
+        if channel_chunk and channel_chunk > 0:
+            # 메모리 절약 경로: 채널을 나눠 upsampling하고 내적과 norm 제곱만 누적한다.
+            # 채널별 보간 결과는 전체 보간과 같고, 채널 합의 순서만 달라 float32 반올림 수준(약 1e-6)의 차이가 난다.
+            batch, channels = render_features.shape[:2]
+            height, width = output_size
+            dot = render_features.new_zeros(batch, 1, height, width)
+            render_sq = render_features.new_zeros(batch, 1, height, width)
+            gt_sq = render_features.new_zeros(batch, 1, height, width)
+            for c0 in range(0, channels, channel_chunk):
+                r = F.interpolate(render_features[:, c0:c0 + channel_chunk], **interpolate_kwargs)
+                g = F.interpolate(gt_features[:, c0:c0 + channel_chunk], **interpolate_kwargs)
+                dot += (r * g).sum(dim=1, keepdim=True)
+                render_sq += (r * r).sum(dim=1, keepdim=True)
+                gt_sq += (g * g).sum(dim=1, keepdim=True)
+                del r, g
+            similarity_map = dot / (render_sq.sqrt().clamp_min(eps) * gt_sq.sqrt().clamp_min(eps))
+            return similarity_map.clamp(-1.0, 1.0)
 
         render_dense = F.interpolate(
             render_features,
@@ -223,7 +245,8 @@ class DinoSimilarity:
                 render_features=feat_r,
                 gt_features=feat_g,
                 output_size=output_size,
-                mode=mode
+                mode=mode,
+                channel_chunk=self.channel_chunk
             )
         else:
             # 기존 방식:

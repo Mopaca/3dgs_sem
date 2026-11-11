@@ -65,7 +65,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     # Created at the same point as the previous DinoSimilarity, so a dino run consumes the RNG identically.
-    guidance = GuidanceMaps([sem_cfg["signal"], sem_cfg["shadow"]], device="cuda", blur_sigma=opt.sem_blur_sigma) ###
+    guidance = GuidanceMaps([sem_cfg["signal"], sem_cfg["shadow"]], device="cuda", blur_sigma=opt.sem_blur_sigma, dino_chunk=opt.sem_dino_chunk) ###
     gaussians.training_setup(opt)
     sem_logger = SemLogger(scene.model_path, enabled=opt.sem_log) ###
     save_run_config(scene.model_path, dataset, opt, pipe, sem_cfg, run_info) ###
