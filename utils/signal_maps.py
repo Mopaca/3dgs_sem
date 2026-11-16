@@ -90,7 +90,7 @@ class GuidanceMaps:
     the same random-number consumption as the previous code.
     """
 
-    def __init__(self, names, device="cuda", dino_model="dinov2_vits14", blur_sigma=4.0, dino_chunk=0):
+    def __init__(self, names, device="cuda", dino_model="dinov2_vits14", blur_sigma=4.0, dino_chunk=0, dino_gt_cache="none"):
         self.names = {n for n in names if n and n != "none"}
         unknown = self.names - set(SIGNALS)
         if unknown:
@@ -100,10 +100,10 @@ class GuidanceMaps:
         self.dino = None
         if "dino" in self.names:
             from utils.dino_utils import DinoSimilarity
-            self.dino = DinoSimilarity(model_name=dino_model, device=device, channel_chunk=dino_chunk)
+            self.dino = DinoSimilarity(model_name=dino_model, device=device, channel_chunk=dino_chunk, gt_cache=dino_gt_cache)
 
     @torch.no_grad()
-    def goodness(self, name, render_chw, gt_chw):
+    def goodness(self, name, render_chw, gt_chw, gt_key=None):
         """
         Args:
             render_chw, gt_chw: [3, H, W] in [0, 1]
@@ -116,7 +116,7 @@ class GuidanceMaps:
         if name == "dino":
             if self.dino is None:
                 raise RuntimeError("DINOv2 was released (densification finished) or never loaded")
-            return self.dino.cosine_map(render_chw.unsqueeze(0), gt_chw.unsqueeze(0)).squeeze(0).detach()
+            return self.dino.cosine_map(render_chw.unsqueeze(0), gt_chw.unsqueeze(0), gt_key=gt_key).squeeze(0).detach()
 
         if name == "ssim":
             return ssim_map(render_chw, gt_chw).detach()

@@ -1,0 +1,219 @@
+From 2688400dd114e365b95d5df9672513e96073188e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 16:49:59 +0900
+Subject: [PATCH] Show training progress in run_decisive.sh
+
+- Training output goes to the terminal and train.log (tee); SHOW_LOG=0/1/2 controls verbosity
+- Run counter, start time, per-run and total elapsed time, one-line result per run
+- train_sim.py --sem_log prints a semantic-selection line every 1000 iterations (tqdm.write)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PHmjveU9kNqt1TKBUX99W4
+---
+ DECISIVE_EXPERIMENT.md     |  2 +-
+ run_decisive.sh            | 72 +++++++++++++++++++++++++++++++++-----
+ tests/test_decisive_cpu.py | 10 +++++-
+ train_sim.py               | 21 +++++++++++
+ 4 files changed, 94 insertions(+), 11 deletions(-)
+
+diff --git a/DECISIVE_EXPERIMENT.md b/DECISIVE_EXPERIMENT.md
+index 7e79560..6378800 100644
+--- a/DECISIVE_EXPERIMENT.md
++++ b/DECISIVE_EXPERIMENT.md
+@@ -33,7 +33,7 @@ SCENES="flowers treehill garden truck" SEEDS="0 1 2" RHO=0.3 bash run_decisive.s
+ python collect_results.py --root output/decisive
+ ```
+ 
+-데이터 경로는 `M360_DIR`, `TANDT_DIR`, `DB_DIR`, 출력 경로는 `OUT_ROOT` 환경변수로 바꾼다. DINOv2를 쓰는 조건은 저장소 최상위에 `dinov2/`가 있어야 한다.
++데이터 경로는 `M360_DIR`, `TANDT_DIR`, `DB_DIR`, 출력 경로는 `OUT_ROOT`, DINOv2 가중치 캐시는 `TORCH_HOME` 환경변수로 바꾼다. 학습 출력은 화면과 `train.log`에 함께 남는다(`SHOW_LOG=1`, 기본값). `SHOW_LOG=2`는 렌더링·지표 계산 출력까지 보여 주고, `SHOW_LOG=0`은 로그 파일에만 쓴다. `--sem_log`가 켜져 있으면 1000 iteration마다 semantic 선택 현황이 한 줄씩 출력되고, 각 run이 끝나면 PSNR·SSIM·LPIPS·#GS·학습 시간이 한 줄로 출력된다. DINOv2를 쓰는 조건은 저장소 최상위에 `dinov2/`가 있어야 한다.
+ 
+ **주의.** `RHO`는 보고된 Ours를 만든 ρ 값으로 맞춰야 한다. 커밋 343c470의 코드에는 0.2, 논문에는 0.3으로 적혀 있다. 임계값 τ_g는 스크립트가 0.0002를 명시적으로 넘기므로 `arguments/__init__.py`의 기본값과 무관하다.
+ 
+diff --git a/run_decisive.sh b/run_decisive.sh
+index 17a8a66..8f54019 100644
+--- a/run_decisive.sh
++++ b/run_decisive.sh
+@@ -10,6 +10,10 @@
+ # Each stage is skipped when its output already exists, so the script can simply be re-run
+ # after an interruption (e.g. a RunPod restart).
+ #
++# Training output is shown on the terminal and saved to train.log (SHOW_LOG=1, default).
++# SHOW_LOG=2 also shows render / metrics / eval_maps output; SHOW_LOG=0 writes log files only.
++# Loss curves can also be followed with:  tensorboard --logdir "$OUT_ROOT"
++#
+ # Usage (from anywhere):
+ #   bash run_decisive.sh
+ #   SCENES="flowers" SEEDS="0" ARMS="dino_l03 ssim_l03" bash run_decisive.sh
+@@ -28,6 +32,8 @@ TANDT_DIR=${TANDT_DIR:-datasets/tandt}
+ DB_DIR=${DB_DIR:-datasets/db}
+ OUT_ROOT=${OUT_ROOT:-output/decisive}
+ export TORCH_HOME=${TORCH_HOME:-/workspace/.cache/torch}
++export PYTHONUNBUFFERED=1   # print training messages immediately when piped through tee
++SHOW_LOG=${SHOW_LOG:-1}
+ 
+ # ---------------- fixed hyperparameters ----------------
+ # Passed explicitly so that the defaults in arguments/__init__.py do not matter.
+@@ -81,6 +87,44 @@ arm_flags() {
+     esac
+ }
+ 
++run_logged() {   # run_logged <level> <logfile> <command...>: shown when SHOW_LOG >= level, always saved
++    local level=$1 log=$2
++    shift 2
++    if [ "$SHOW_LOG" -ge "$level" ]; then
++        "$@" 2>&1 | tee "$log"
++        return "${PIPESTATUS[0]}"
++    else
++        "$@" > "$log" 2>&1
++    fi
++}
++
++show_result() {  # one line with the metrics, #GS and training time of a finished run
++    python -c '
++import json, os, sys
++d = sys.argv[1]
++def rj(name):
++    try:
++        with open(os.path.join(d, name)) as f:
++            return json.load(f)
++    except (OSError, ValueError):
++        return {}
++r, t = rj("results.json"), rj("train_stats.json")
++it = lambda k: int(k.split("_")[-1]) if k.split("_")[-1].isdigit() else -1
++m = r[max(r, key=it)] if r else {}
++parts = ["%s=%.4f" % (n, m[n]) for n in ("PSNR", "SSIM", "LPIPS") if n in m]
++if t.get("num_gaussians"):
++    parts.append("#GS=%.2fM" % (t["num_gaussians"] / 1e6))
++if t.get("wall_time_min"):
++    parts.append("train=%.1fmin" % t["wall_time_min"])
++print("[decisive]   result: " + ("  ".join(parts) if parts else "n/a"))
++' "$1"
++}
++
++count_words() { set -- $1; echo $#; }
++TOTAL=$(( $(count_words "$SCENES") * $(count_words "$ARMS") * $(count_words "$SEEDS") ))
++RUN_IDX=0
++T_ALL=$(date +%s)
++
+ for scene in $SCENES; do
+     src_img=$(scene_source "$scene") || { echo "[decisive] unknown scene: $scene"; exit 1; }
+     read -r SRC IMG <<< "$src_img"
+@@ -94,29 +138,39 @@ for scene in $SCENES; do
+             mkdir -p "$out"
+             cmd="python train_sim.py -s $SRC -i $IMG -m $out --seed $seed $COMMON $flags"
+             echo "$cmd" > "$out/command.txt"
++            RUN_IDX=$((RUN_IDX + 1))
++            T_RUN=$(date +%s)
+             echo "============================================================"
+-            echo "[decisive] $scene / $arm / seed$seed"
++            echo "[decisive] ($RUN_IDX/$TOTAL) $scene / $arm / seed$seed   [$(date '+%m-%d %H:%M')]"
++            echo "[decisive]   $cmd"
+ 
+             if [ ! -f "$out/train_stats.json" ]; then
+-                $cmd > "$out/train.log" 2>&1 || { echo "[decisive] TRAIN FAILED: $out (see train.log)"; continue; }
++                echo "[decisive]   train ..."
++                run_logged 1 "$out/train.log" $cmd || { echo "[decisive] TRAIN FAILED: $out (see train.log)"; continue; }
+             else
+-                echo "  train: done, skipped"
++                echo "[decisive]   train: done, skipped"
+             fi
+ 
+             if [ ! -d "$out/test/ours_$ITER/renders" ]; then
+-                python render.py -m "$out" --iteration $ITER --skip_train > "$out/render.log" 2>&1 \
+-                    || { echo "[decisive] RENDER FAILED: $out"; continue; }
++                echo "[decisive]   render ..."
++                run_logged 2 "$out/render.log" python render.py -m "$out" --iteration $ITER --skip_train \
++                    || { echo "[decisive] RENDER FAILED: $out (see render.log)"; continue; }
+             fi
+ 
+             if [ ! -f "$out/results.json" ]; then
+-                python metrics.py -m "$out" > "$out/metrics.log" 2>&1 \
+-                    || { echo "[decisive] METRICS FAILED: $out"; continue; }
++                echo "[decisive]   metrics ..."
++                run_logged 2 "$out/metrics.log" python metrics.py -m "$out" \
++                    || { echo "[decisive] METRICS FAILED: $out (see metrics.log)"; continue; }
+             fi
+ 
+             if [ ! -f "$out/eval_maps.json" ]; then
+-                python eval_maps.py -m "$out" > "$out/eval_maps.log" 2>&1 \
+-                    || echo "[decisive] EVAL_MAPS FAILED: $out (metrics are still valid)"
++                echo "[decisive]   eval_maps ..."
++                run_logged 2 "$out/eval_maps.log" python eval_maps.py -m "$out" \
++                    || echo "[decisive] EVAL_MAPS FAILED: $out (metrics are still valid; see eval_maps.log)"
+             fi
++
++            show_result "$out"
++            echo "[decisive]   run time $(( ($(date +%s) - T_RUN) / 60 )) min, total $(( ($(date +%s) - T_ALL) / 60 )) min"
+         done
+     done
+ done
+diff --git a/tests/test_decisive_cpu.py b/tests/test_decisive_cpu.py
+index 5ee7045..8b2819b 100644
+--- a/tests/test_decisive_cpu.py
++++ b/tests/test_decisive_cpu.py
+@@ -271,7 +271,7 @@ def test_resolve_config():
+     print("[6] resolve_sem_config")
+     with open(os.path.join(ROOT, "train_sim.py"), encoding="utf-8") as f:
+         tree = ast.parse(f.read())
+-    keep = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "resolve_sem_config"
++    keep = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("resolve_sem_config", "sem_console_line")
+             or isinstance(n, ast.Assign) and any(getattr(t, "id", "").startswith("SEM_") for t in n.targets)]
+     ns = {"json": json, "SIGNALS": ("dino", "ssim", "l1", "l1_blur")}
+     exec(compile(ast.Module(body=keep, type_ignores=[]), "train_sim_subset", "exec"), ns)
+@@ -282,6 +282,14 @@ def test_resolve_config():
+     check(cfg["view_norm"] == "mean" and cfg["view_agg"] == "mean", "ours: auto -> mean / mean")
+     cfg = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_mode="r9", sem_lambda_scale=0.0)))
+     check(cfg["view_norm"] == "sum" and cfg["view_agg"] == "max", "r9: auto -> sum / max")
++    line = ns["sem_console_line"](3000, {"n_total": 1234567, "n_grad": 1200, "n_sem": 300, "n_sem_only": 120,
++                                          "interval_counts": [4000, 300, 40], "interval_samples": [100, 100, 40],
++                                          "radius_sem": {"frac_ge_ref": 0.35}}, {"g3_only_by_scale_weight": 0.8})
++    print("   ", line)
++    check(line.startswith("[sem 3000]") and "G1/G2/G3=4000/300/40" in line and "80%" in line, "console progress line")
++    check("r9 candidates" in ns["sem_console_line"](3000, {"n_total": 10, "n_grad": 1, "n_sem": 2, "n_sem_only": 1,
++                                                           "r9_n_candidates": 5, "r9_cap_bound": True}, None),
++          "console progress line (r9 mode)")
+     for bad in [dict(sem_view_norm="sum"), dict(sem_view_agg="max"), dict(sem_signal="vgg"),
+                 dict(sem_mode="r9", sem_select="radius_matched")]:
+         try:
+diff --git a/train_sim.py b/train_sim.py
+index 75bfc66..e6ebd22 100644
+--- a/train_sim.py
++++ b/train_sim.py
+@@ -291,6 +291,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                     sem_logger.log_step(iteration, step_stats, extra={ ###
+                         "iters_since_opacity_reset": (iteration - last_reset) if last_reset > 0 else None, ###
+                         "scale_weight": sw_summary}) ###
++                    if sem_logger.enabled and iteration % 1000 == 0: ### one console line per 1000 iterations
++                        progress_bar.write(sem_console_line(iteration, step_stats, sw_summary))
+                     gaussians.reset_similarity_accum() ###
+                     gaussians.reset_similarity_aux() ###
+                 ###
+@@ -412,6 +414,25 @@ def write_train_stats(model_path, gaussians, opt, t_train_start, t_densify_end):
+     print(f"[sem] train stats: {json.dumps(stats)}")
+ 
+ 
++def sem_console_line(iteration, stats, sw_summary):
++    """Short progress line of the semantic selection (printed through tqdm, does not break the bar)."""
++    if not stats:
++        return f"[sem {iteration}] no statistics"
++    parts = [f"N={stats['n_total'] / 1e6:.2f}M", f"grad={stats['n_grad']}",
++             f"sem={stats['n_sem']} (sem-only {stats['n_sem_only']})"]
++    if "interval_counts" in stats:
++        parts.append("G1/G2/G3=" + "/".join(str(c) for c in stats["interval_counts"]) +
++                     " K=" + "/".join(str(k) for k in stats["interval_samples"]))
++    if "r9_n_candidates" in stats:
++        parts.append(f"r9 candidates={stats['r9_n_candidates']} cap={'hit' if stats.get('r9_cap_bound') else 'no'}")
++    frac = (stats.get("radius_sem") or {}).get("frac_ge_ref")
++    if frac is not None:
++        parts.append(f"M_sem r>=R_max {100 * frac:.0f}%")
++    if sw_summary and sw_summary.get("g3_only_by_scale_weight") is not None:
++        parts.append(f"G3 only by scale weight {100 * sw_summary['g3_only_by_scale_weight']:.0f}%")
++    return f"[sem {iteration}] " + " | ".join(parts)
++
++
+ def set_seed(seed):
+     random.seed(seed)
+     np.random.seed(seed)
+-- 
+2.43.0
+

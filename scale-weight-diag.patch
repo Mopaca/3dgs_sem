@@ -1,0 +1,918 @@
+From 4c48964eaf8a41e9c9014df38290615ee1ed7d14 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 16:04:32 +0900
+Subject: [PATCH] Scale-weight diagnostics: projected radius, scale weight and
+ unweighted score
+
+- sim_diag_accum (radius, scale weight, unweighted view score over valid views) replaces
+  sim_radius_accum; fed by train_sim.py and train_sim_rendersim.py
+- utils/scale_weight_stats.py: interval membership with / without the scale weight,
+  transition matrix, fraction of large Gaussians per interval, "G3 only by scale weight"
+- save_similarity_scale_statistics_json records these fields (subsampled, compact JSON)
+- train_sim.py --sem_log adds the summary to sem_log.jsonl and npz snapshots
+- similarity_scale_scatter.py plots similarity vs radius, unweighted vs weighted score,
+  radius distributions, and the previous scale-ratio scatter
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PHmjveU9kNqt1TKBUX99W4
+---
+ DECISIVE_EXPERIMENT.md      |   9 ++
+ scene/gaussian_model.py     |  48 ++++--
+ similarity_scale_scatter.py | 295 +++++++++++++++++++++++++++++-------
+ tests/test_decisive_cpu.py  |  77 +++++++++-
+ train_sim.py                |  14 +-
+ train_sim_rendersim.py      |  64 ++++----
+ utils/scale_weight_stats.py | 130 ++++++++++++++++
+ utils/sem_logger.py         |   6 +
+ 8 files changed, 537 insertions(+), 106 deletions(-)
+ create mode 100644 utils/scale_weight_stats.py
+
+diff --git a/DECISIVE_EXPERIMENT.md b/DECISIVE_EXPERIMENT.md
+index d03ef11..7e79560 100644
+--- a/DECISIVE_EXPERIMENT.md
++++ b/DECISIVE_EXPERIMENT.md
+@@ -52,3 +52,12 @@ python collect_results.py --root output/decisive
+ `--sem_signal dino|ssim|l1|l1_blur`, `--sem_mode ours|r9`, `--sem_select stratified|random_matched|radius_matched`, `--sem_view_norm auto|mean|sum`, `--sem_view_agg auto|mean|min|max`, `--sem_lambda_scale`, `--sem_radius_min`, `--sem_radius_max`, `--sem_sample_ratio`, `--sem_r9_threshold`, `--sem_r9_cap`, `--sem_blur_sigma`, `--sem_shadow`, `--sem_split adc|mask2`, `--sem_log`, 그리고 `train_sim.py`의 `--seed` (0이면 기존과 같은 고정 seed).
+ 
+ 기본값(dino, ours, stratified, adc, shadow 없음)에서는 기존 계산과 같다. ours 모드에서 가중 합(`--sem_view_norm sum`)은 막아 두었다. goodness 점수를 합하면 넓게 덮는 가우시안일수록 잘 복원된 것으로 판정되기 때문이며, 가중 합 비교는 오차 점수를 쓰는 r9 모드에서 한다.
++
++## scale weight 진단 (리뷰 4순위)
++
++scale weight가 큰 가우시안을 G₃로 밀어 넣는지 보기 위해, 각 가우시안에 대해 유효 view 동안의 투영 반지름, scale weight, scale weight를 적용하기 전 점수를 함께 누적한다(`sim_diag_accum`). 투영 반지름은 rasterizer가 투영된 2D 공분산의 최대 고윳값으로 계산하는 3σ 반지름(px)으로, scale weight가 정규화하는 바로 그 값이다. 기존 `scale_ratio`(3D scale의 최소/최대 축 비)는 모양의 길쭉함을 나타낼 뿐 화면에서의 크기와는 다르다.
++
++- `train_sim.py --sem_log`: 매 densification 단계의 `sem_log.jsonl`에 `scale_weight` 요약(가중 전후 구간 개수, 전이 행렬, 구간별 R_max 이상 비율, "scale weight 때문에만 G₃인 비율")을 기록하고, 스냅샷 시점에는 `sem_snapshots/scale_weight_iter_*.npz`를 저장한다.
++- `train_sim_rendersim.py`의 `save_similarity_scale_statistics_json`: 같은 정보를 `similarity_scale_statistics.json`에 기록한다(최대 10만 개 표본, 기존 `similarity`·`scale_ratio` 필드 유지).
++- `python similarity_scale_scatter.py <model_path>`: 두 입력 중 있는 쪽을 읽어 similarity–반지름 산점도, 가중 전–후 점수 산점도, 반지름 분포, 기존 scale ratio 산점도와 `summary.txt`를 만든다.
++
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index cfd24b3..03e529a 100644
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -87,7 +87,9 @@ class GaussianModel:
+         self.sim_score_accum = torch.empty(0) ###
+         self.sim_view_count = torch.empty(0) ###
+         self.similarity_score = torch.empty(0) ###
+-        self.sim_radius_accum = torch.empty(0) ### sum of projected radius over valid views (logging, radius control)
++        # per-Gaussian sums over the valid views of the current interval (diagnostics, radius control):
++        #   [:, 0] projected radius (px), [:, 1] scale weight, [:, 2] unweighted view score (clamped to [0, 1])
++        self.sim_diag_accum = torch.empty(0) ###
+ 
+     def capture(self):
+         return (
+@@ -252,7 +254,7 @@ class GaussianModel:
+         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+-        self.sim_radius_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
++        self.sim_diag_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda") ###
+ 
+         l = [
+             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+@@ -339,8 +341,8 @@ class GaussianModel:
+         self.sim_score_accum.zero_()
+         self.sim_view_count.zero_()
+         self.similarity_score.zero_()
+-        if self.sim_radius_accum.numel() == self.sim_view_count.numel():
+-            self.sim_radius_accum.zero_()
++        if self._diag_ready(self.sim_view_count.shape[0]):
++            self.sim_diag_accum.zero_()
+     
+     def reset_similarity_aux(self):
+         with torch.no_grad():
+@@ -404,18 +406,23 @@ class GaussianModel:
+         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+-        self.sim_radius_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
++        self.sim_diag_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda") ###
+ 
+         self.active_sh_degree = self.max_sh_degree
+ 
+ #####
+-    def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None):
++    def _diag_ready(self, n):
++        return self.sim_diag_accum.dim() == 2 and self.sim_diag_accum.shape[0] == n
++
++    def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None, scale_weight=None, raw_score=None):
+         """
+         view_score:   [N, 1] weighted view score of the current view
+         visible_mask: [N, 1] float, 1 for valid views (visible and contribution sum > tau_v)
+         agg:          "mean" (proposed; identical to the previous implementation),
+                       "min" (worst view of a goodness score), "max" (worst view of an error score, [9])
+         radius:       [N, 1] projected radius of the current view (optional, for logging / radius control)
++        scale_weight: [N, 1] scale weight applied in the current view (optional, diagnostics)
++        raw_score:    [N, 1] view score before the scale weight, clamped to [0, 1] (optional, diagnostics)
+         """
+         if agg == "mean":
+             self.sim_score_accum += view_score * visible_mask
+@@ -427,8 +434,10 @@ class GaussianModel:
+         else:
+             raise ValueError(f"Unknown view aggregation: {agg}")
+         self.sim_view_count += visible_mask
+-        if radius is not None and self.sim_radius_accum.numel() == self.sim_view_count.numel():
+-            self.sim_radius_accum += radius * visible_mask
++        if self._diag_ready(self.sim_view_count.shape[0]):
++            for col, value in ((0, radius), (1, scale_weight), (2, raw_score)):
++                if value is not None:
++                    self.sim_diag_accum[:, col:col + 1] += value * visible_mask
+         # self.sim_score_accum += view_score
+ 
+     def finalize_similarity_score(self, eps=1e-8, agg="mean"):
+@@ -444,10 +453,21 @@ class GaussianModel:
+ 
+     def get_mean_projected_radius(self):
+         """[N] mean projected radius (px) over the valid views of the current interval, 0 if unseen."""
++        return self._diag_mean(0)
++
++    def get_mean_scale_weight(self):
++        """[N] mean scale weight over the valid views of the current interval, 0 if unseen."""
++        return self._diag_mean(1)
++
++    def get_unweighted_similarity(self):
++        """[N] mean view score without the scale weight (same views, same [0, 1] clamp), 0 if unseen."""
++        return self._diag_mean(2)
++
++    def _diag_mean(self, col):
+         count = self.sim_view_count.squeeze(1)
+-        if self.sim_radius_accum.numel() != count.numel():
++        if not self._diag_ready(count.shape[0]):
+             return torch.zeros_like(count)
+-        return self.sim_radius_accum.squeeze(1) / count.clamp_min(1.0)
++        return self.sim_diag_accum[:, col] / count.clamp_min(1.0)
+ #####
+ 
+     def replace_tensor_to_optimizer(self, tensor, name):
+@@ -694,8 +714,8 @@ class GaussianModel:
+         self.sim_score_accum = self.sim_score_accum[valid_points_mask] ###
+         self.sim_view_count = self.sim_view_count[valid_points_mask] ###
+         self.similarity_score = self.similarity_score[valid_points_mask] ###
+-        if self.sim_radius_accum.numel() == valid_points_mask.numel(): ###
+-            self.sim_radius_accum = self.sim_radius_accum[valid_points_mask] ###
++        if self._diag_ready(valid_points_mask.shape[0]): ###
++            self.sim_diag_accum = self.sim_diag_accum[valid_points_mask] ###
+         self._similarity_aux = nn.Parameter(self._similarity_aux[valid_points_mask].detach().requires_grad_(True)) ###
+ 
+ 
+@@ -746,8 +766,8 @@ class GaussianModel:
+         self.sim_score_accum = torch.cat([self.sim_score_accum, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+         self.sim_view_count = torch.cat([self.sim_view_count, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+         self.similarity_score = torch.cat([self.similarity_score, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+-        if self.sim_radius_accum.numel() == self.sim_score_accum.numel() - new_count: ###
+-            self.sim_radius_accum = torch.cat([self.sim_radius_accum, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
++        if self._diag_ready(self.sim_score_accum.shape[0] - new_count): ###
++            self.sim_diag_accum = torch.cat([self.sim_diag_accum, torch.zeros((new_count, 3), device="cuda")], dim=0) ###
+         self._similarity_aux = nn.Parameter(torch.cat([self._similarity_aux.detach(), torch.zeros((new_count, 3), device="cuda")], dim=0).requires_grad_(True)) ###
+ 
+     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+diff --git a/similarity_scale_scatter.py b/similarity_scale_scatter.py
+index 71945fc..2968689 100644
+--- a/similarity_scale_scatter.py
++++ b/similarity_scale_scatter.py
+@@ -1,62 +1,243 @@
++#
++# Similarity vs projected radius / scale weight plots (review item 4).
++#
++# Input (either):
++#   <model>/similarity_scale_statistics.json          from train_sim_rendersim.save_similarity_scale_statistics_json
++#   <model>/sem_snapshots/scale_weight_iter_*.npz     from train_sim.py --sem_log (summary taken from sem_log.jsonl)
++#
++# Output: <model>/similarity_scale_scatter/
++#   <iter>_radius.png          similarity (with scale weight) vs projected radius, colored by interval G1..G3
++#   <iter>_raw_vs_weighted.png similarity without vs with the scale weight; the box below the weighted G3
++#                              boundary and right of the unweighted G3 boundary = "G3 only because of the weight"
++#   <iter>_radius_hist.png     projected-radius distribution: all valid / G3 with weight / G3 without weight
++#   <iter>_scale_ratio.png     the previous plot (similarity vs min/max world scale), when available
++#   summary.txt                the per-iteration summary numbers
++#
++# Usage:  python similarity_scale_scatter.py output/flowers_dino
++#
++
++import argparse
++import glob
+ import json
+ import os
++
++import matplotlib
++matplotlib.use("Agg")
+ import matplotlib.pyplot as plt
+ import numpy as np
+ 
+-def plot_similarity_scale_scatter(model_path):
+-
+-    json_path = os.path.join(
+-        model_path,
+-        "similarity_scale_statistics.json"
+-    )
+-
+-    with open(json_path, "r") as f:
+-        data = json.load(f)
+-
+-    save_dir = os.path.join(
+-        model_path,
+-        "similarity_scale_scatter"
+-    )
+-
+-    os.makedirs(save_dir, exist_ok=True)
+-
+-    for record in data:
+-
+-        iteration = record["iteration"]
+-
+-        similarity = [p["similarity"] for p in record["points"]]
+-        scale_ratio = [p["scale_ratio"] for p in record["points"]]
+-
+-        plt.figure(figsize=(6,6))
+-
+-        plt.scatter(
+-            similarity,
+-            scale_ratio,
+-            s=2,
+-            alpha=0.3
+-        )
+-
+-        plt.xlabel("Similarity Score")
+-        plt.ylabel("Scale Ratio (min/max)")
+-        plt.title(f"Iteration {iteration}")
+-
+-        plt.xlim(0,1)
+-        plt.ylim(0,1)
+-
+-        plt.grid(alpha=0.3)
+-
+-        plt.tight_layout()
+-
+-        plt.savefig(
+-            os.path.join(
+-                save_dir,
+-                f"{iteration:06d}.png"
+-            ),
+-            dpi=300
+-        )
+-
+-        plt.close()
+-    print(np.corrcoef(similarity, scale_ratio)[0, 1])
+-    print("Done.")
+-
+-plot_similarity_scale_scatter("output/treehill8_hybrid2/")
+\ No newline at end of file
++# reference palette (dataviz skill): ordinal one-hue ramp for G1..G3, neutral gray for the rest
++SURFACE = "#fcfcfb"
++TEXT = "#0b0b0b"
++TEXT_2 = "#52514e"
++GRID = "#e4e3df"
++NEUTRAL = "#b5b4ae"
++INTERVAL_COLORS = {1: "#6da7ec", 2: "#256abf", 3: "#0d366b"}
++CONTRAST = "#eb6834"     # second categorical slot, used for the "without scale weight" series
++INTERVAL_NAMES = {0: "other valid", 1: "G1", 2: "G2", 3: "G3"}
++
++
++def load_records(model_path):
++    json_path = os.path.join(model_path, "similarity_scale_statistics.json")
++    if os.path.exists(json_path):
++        with open(json_path) as f:
++            data = json.load(f)
++        records = []
++        for rec in data:
++            pts = rec.get("points", [])
++            if not pts:
++                continue
++            keys = pts[0].keys()
++            arrays = {k: np.asarray([p[k] for p in pts]) for k in keys}
++            records.append({"iteration": rec["iteration"], "summary": rec.get("summary"), "points": arrays})
++        return records
++
++    summaries = {}
++    log_path = os.path.join(model_path, "sem_log.jsonl")
++    if os.path.exists(log_path):
++        with open(log_path) as f:
++            for line in f:
++                if line.strip():
++                    r = json.loads(line)
++                    summaries[r["iteration"]] = r.get("scale_weight")
++    records = []
++    for path in sorted(glob.glob(os.path.join(model_path, "sem_snapshots", "scale_weight_iter_*.npz"))):
++        it = int(os.path.basename(path).split("_")[-1].split(".")[0])
++        z = np.load(path)
++        records.append({"iteration": it, "summary": summaries.get(it), "points": {k: z[k] for k in z.files}})
++    return records
++
++
++def style(ax, title, xlabel, ylabel):
++    ax.set_facecolor(SURFACE)
++    ax.set_title(title, color=TEXT, fontsize=11, loc="left")
++    ax.set_xlabel(xlabel, color=TEXT_2)
++    ax.set_ylabel(ylabel, color=TEXT_2)
++    ax.tick_params(colors=TEXT_2, labelsize=9)
++    ax.grid(color=GRID, linewidth=0.8)
++    ax.set_axisbelow(True)
++    for side in ("top", "right"):
++        ax.spines[side].set_visible(False)
++    for side in ("left", "bottom"):
++        ax.spines[side].set_color(GRID)
++
++
++def boundaries(stats):
++    if not stats or stats.get("mean") is None or stats.get("std") is None:
++        return None
++    m, s = stats["mean"], stats["std"]
++    return [m - s, m - 2 * s, m - 3 * s]
++
++
++def save(fig, path):
++    fig.patch.set_facecolor(SURFACE)
++    fig.tight_layout()
++    fig.savefig(path, dpi=200, facecolor=SURFACE)
++    plt.close(fig)
++
++
++def plot_radius(rec, out_dir, r_ref):
++    p, it = rec["points"], rec["iteration"]
++    x, y, lab = p["radius"], p["similarity"], p["interval"]
++    xmax = max(2 * r_ref, float(np.percentile(x, 99.5)))
++    fig, ax = plt.subplots(figsize=(6.4, 4.8))
++    for k in (0, 1, 2, 3):  # draw the rare low intervals last
++        m = lab == k
++        if not m.any():
++            continue
++        ax.scatter(x[m], y[m], s=2 if k == 0 else 4, alpha=0.35 if k == 0 else 0.8, linewidths=0,
++                   color=NEUTRAL if k == 0 else INTERVAL_COLORS[k], label=f"{INTERVAL_NAMES[k]} (n={int(m.sum())})",
++                   rasterized=True)
++    ax.axvline(r_ref, color=TEXT_2, linestyle="--", linewidth=1)
++    ax.text(r_ref, 1.0, f" R_max = {r_ref:g}px", color=TEXT_2, fontsize=8, va="top", transform=ax.get_xaxis_transform())
++    b = boundaries((rec["summary"] or {}).get("weighted"))
++    if b:
++        for v, name in zip(b, ("μ−σ", "μ−2σ", "μ−3σ")):
++            ax.axhline(v, color=GRID, linestyle=":", linewidth=1)
++            ax.text(xmax, v, f"{name} ", color=TEXT_2, fontsize=8, ha="right", va="bottom")
++    ax.set_xlim(0, xmax)
++    style(ax, f"Iteration {it}: similarity (with scale weight) vs projected radius",
++          "mean projected radius over valid views (px)", "similarity score S_k")
++    ax.legend(loc="lower left", fontsize=8, frameon=False, markerscale=3, labelcolor=TEXT,
++              title="n = plotted sample", title_fontsize=8)
++    save(fig, os.path.join(out_dir, f"{it:06d}_radius.png"))
++
++
++def plot_raw_vs_weighted(rec, out_dir, r_ref):
++    p, it = rec["points"], rec["iteration"]
++    x, y, r = p["similarity_raw"], p["similarity"], p["radius"]
++    large = r >= r_ref
++    fig, ax = plt.subplots(figsize=(5.6, 5.6))
++    ax.scatter(x[~large], y[~large], s=2, alpha=0.35, linewidths=0, color=NEUTRAL,
++               label=f"radius < {r_ref:g}px (n={int((~large).sum())})", rasterized=True)
++    ax.scatter(x[large], y[large], s=3, alpha=0.6, linewidths=0, color=INTERVAL_COLORS[2],
++               label=f"radius ≥ {r_ref:g}px (n={int(large.sum())})", rasterized=True)
++    lo = max(-1.0, float(min(np.percentile(x, 0.1), np.percentile(y, 0.1))) - 0.05)  # zoom to the data
++    ax.plot([lo, 1], [lo, 1], color=TEXT_2, linewidth=1, label="no change (y = x)")
++    w_min = float(np.min(p["scale_weight"])) if "scale_weight" in p else None
++    if w_min is not None and w_min < 0.999:
++        ax.plot([lo, 1], [lo * w_min, w_min], color=TEXT_2, linewidth=1, linestyle="--",
++                label=f"largest reduction (y = {w_min:.2f}·x)")
++    s = rec["summary"] or {}
++    bw, br = boundaries(s.get("weighted")), boundaries(s.get("unweighted"))
++    if bw and br:
++        ax.axhline(bw[2], color=CONTRAST, linewidth=1, linestyle=":")
++        ax.axvline(br[2], color=CONTRAST, linewidth=1, linestyle=":")
++        ax.text(lo, bw[2], " G3 boundary (with weight)", color=TEXT_2, fontsize=8, ha="left", va="bottom")
++        ax.text(br[2], 1.0, "G3 boundary (without weight) ", color=TEXT_2, fontsize=8, rotation=90, ha="right", va="top")
++        frac = s.get("g3_only_by_scale_weight")
++        if frac is not None:
++            # the region above y = x is always empty (the weight never raises a score)
++            ax.text(0.03, 0.58, f"G3 only because of\nthe scale weight: {100 * frac:.1f}%", color=TEXT, fontsize=9,
++                    ha="left", va="top", transform=ax.transAxes)
++    ax.set_xlim(lo, 1)
++    ax.set_ylim(lo, 1)
++    style(ax, f"Iteration {it}: score without vs with scale weight",
++          "similarity without scale weight (same views)", "similarity with scale weight S_k")
++    ax.legend(loc="upper left", fontsize=8, frameon=False, markerscale=3, labelcolor=TEXT,
++              title="n = plotted sample", title_fontsize=8)
++    save(fig, os.path.join(out_dir, f"{it:06d}_raw_vs_weighted.png"))
++
++
++def plot_radius_hist(rec, out_dir, r_ref):
++    p, it = rec["points"], rec["iteration"]
++    r = p["radius"]
++    xmax = max(2 * r_ref, float(np.percentile(r, 99.5)))
++    bins = np.linspace(0, xmax, 60)
++    fig, ax = plt.subplots(figsize=(6.4, 4.0))
++    series = [("all valid", np.ones_like(r, dtype=bool), NEUTRAL),
++              ("G3 with scale weight", p["interval"] == 3, INTERVAL_COLORS[3]),
++              ("G3 without scale weight", p["interval_raw"] == 3, CONTRAST)]
++    for name, m, c in series:
++        if m.sum() < 2:
++            continue
++        frac = float((r[m] >= r_ref).mean())
++        ax.hist(np.clip(r[m], 0, xmax), bins=bins, density=True, histtype="step", linewidth=2, color=c,
++                label=f"{name} (n={int(m.sum())}, ≥{r_ref:g}px: {100 * frac:.0f}%)")
++    ax.axvline(r_ref, color=TEXT_2, linestyle="--", linewidth=1)
++    ax.set_xlim(0, xmax)
++    style(ax, f"Iteration {it}: projected radius distribution", "mean projected radius over valid views (px)", "density")
++    ax.legend(fontsize=8, frameon=False, labelcolor=TEXT, title="n = plotted sample", title_fontsize=8)
++    save(fig, os.path.join(out_dir, f"{it:06d}_radius_hist.png"))
++
++
++def plot_scale_ratio(rec, out_dir):
++    p, it = rec["points"], rec["iteration"]
++    fig, ax = plt.subplots(figsize=(5.6, 5.6))
++    ax.scatter(p["similarity"], p["scale_ratio"], s=2, alpha=0.3, linewidths=0, color=INTERVAL_COLORS[2], rasterized=True)
++    ax.set_xlim(0, 1)
++    ax.set_ylim(0, 1)
++    style(ax, f"Iteration {it}", "similarity score S_k", "scale ratio (min/max world scale)")
++    save(fig, os.path.join(out_dir, f"{it:06d}_scale_ratio.png"))
++    return float(np.corrcoef(p["similarity"], p["scale_ratio"])[0, 1])
++
++
++def summary_lines(rec):
++    s = rec["summary"]
++    if not s or not s.get("diag_available"):
++        return [f"[{rec['iteration']}] no summary"]
++    pct = lambda v: "n/a" if v is None else f"{100 * v:.1f}%"
++    g = s["per_interval_weighted"]
++    lines = [f"[{rec['iteration']}] valid={s['n_valid']}  large(>= {s['radius_ref']:g}px)={pct(s['frac_large_valid'])}",
++             f"    G1/G2/G3 with weight    = {s['weighted']['counts']}",
++             f"    G1/G2/G3 without weight = {s['unweighted']['counts']}",
++             f"    large fraction G1/G2/G3 = {pct(g['G1']['frac_large'])} / {pct(g['G2']['frac_large'])} / {pct(g['G3']['frac_large'])}",
++             f"    G3 only by scale weight = {pct(s['g3_only_by_scale_weight'])},  "
++             f"G1..G3 only by scale weight = {pct(s['candidates_only_by_scale_weight'])}",
++             f"    spearman(score, radius) with / without weight = "
++             f"{s['spearman_weighted_vs_radius']} / {s['spearman_unweighted_vs_radius']}",
++             f"    transition (rows: with weight none,G1,G2,G3 / cols: without) = {s['transition_weighted_x_unweighted']}"]
++    return lines
++
++
++def plot_similarity_scale_scatter(model_path, radius_ref=None):
++    records = load_records(model_path)
++    if not records:
++        print(f"No similarity-scale statistics found in {model_path}")
++        return
++    out_dir = os.path.join(model_path, "similarity_scale_scatter")
++    os.makedirs(out_dir, exist_ok=True)
++    lines = []
++    for rec in records:
++        p = rec["points"]
++        r_ref = radius_ref or ((rec["summary"] or {}).get("radius_ref") or 20.0)
++        if "radius" in p:
++            plot_radius(rec, out_dir, r_ref)
++            plot_raw_vs_weighted(rec, out_dir, r_ref)
++            plot_radius_hist(rec, out_dir, r_ref)
++        if "scale_ratio" in p:
++            corr = plot_scale_ratio(rec, out_dir)
++            lines.append(f"[{rec['iteration']}] corr(similarity, scale_ratio) = {corr:.4f}")
++        lines.extend(summary_lines(rec))
++    with open(os.path.join(out_dir, "summary.txt"), "w") as f:
++        f.write("\n".join(lines) + "\n")
++    print("\n".join(lines))
++    print(f"Done: {out_dir}")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("model_path")
++    parser.add_argument("--radius_ref", type=float, default=None, help="R_max line (default: value stored in the summary)")
++    args = parser.parse_args()
++    plot_similarity_scale_scatter(args.model_path, args.radius_ref)
+diff --git a/tests/test_decisive_cpu.py b/tests/test_decisive_cpu.py
+index 660c8e7..5ee7045 100644
+--- a/tests/test_decisive_cpu.py
++++ b/tests/test_decisive_cpu.py
+@@ -118,7 +118,8 @@ def random_step_inputs(n, seed):
+         "denom": count.clone(),
+         "sim_score_accum": score * count,
+         "sim_view_count": count,
+-        "sim_radius_accum": torch.rand((n, 1), generator=g) * 40 * count,
++        "sim_diag_accum": torch.cat([torch.rand((n, 1), generator=g) * 40, torch.rand((n, 1), generator=g) * 0.3 + 0.7,
++                                     score], dim=1) * count,
+         "max_radii2D": torch.rand((n,), generator=g) * 40,
+         "radii": (torch.rand((n,), generator=g) * 40).int(),
+     }
+@@ -130,8 +131,8 @@ def apply_inputs(m, inp):
+     m.sim_score_accum = inp["sim_score_accum"].clone()
+     m.sim_view_count = inp["sim_view_count"].clone()
+     m.max_radii2D = inp["max_radii2D"].clone()
+-    if hasattr(m, "sim_radius_accum") and m.sim_radius_accum.numel() == m.sim_view_count.numel():
+-        m.sim_radius_accum = inp["sim_radius_accum"].clone()
++    if hasattr(m, "sim_diag_accum") and m._diag_ready(m.sim_view_count.shape[0]):
++        m.sim_diag_accum = inp["sim_diag_accum"].clone()
+ 
+ 
+ def model_state(m):
+@@ -175,7 +176,7 @@ def test_full_step_equivalence():
+             same = all(so[k].shape == sn[k].shape and torch.equal(so[k], sn[k]) for k in so)
+             check(same, f"step {step}: identical Gaussians after densify+prune "
+                         f"(N {n} -> {new.get_xyz.shape[0]}, collect_stats={collect})")
+-            check(new.sim_radius_accum.shape[0] == new.get_xyz.shape[0], f"step {step}: sim_radius_accum length tracks N")
++            check(new.sim_diag_accum.shape == (new.get_xyz.shape[0], 3), f"step {step}: sim_diag_accum shape tracks N")
+             if collect:
+                 check(stats is not None and stats["n_union"] == stats["n_grad"] + stats["n_sem"] - stats["n_inter"],
+                       f"step {step}: stats consistent (n_sem={stats['n_sem']}, n_sem_only={stats['n_sem_only']}, "
+@@ -194,7 +195,7 @@ def test_full_step_equivalence():
+         st = m.densify_and_prune_by_similarity(2e-4, 0.005, 2.0, 20, inp["radii"], 3100, model_path=None,
+                                                sem_cfg=dict(cfg, collect_stats=True))
+         ok = all(t.shape[0] == m.get_xyz.shape[0] for t in
+-                 [m.sim_score_accum, m.sim_view_count, m.similarity_score, m.sim_radius_accum, m._similarity_aux])
++                 [m.sim_score_accum, m.sim_view_count, m.similarity_score, m.sim_diag_accum, m._similarity_aux])
+         check(ok, f"{cfg}: runs, n_sem={st['n_sem']}, state lengths consistent")
+ 
+ 
+@@ -204,7 +205,7 @@ def test_accumulate():
+         mod = cpu_module(f.read(), "gaussian_model_acc")
+     m = mod.GaussianModel(3)
+     n = 50
+-    m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1)); m.sim_radius_accum = torch.zeros((n, 1))
++    m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1)); m.sim_diag_accum = torch.zeros((n, 3))
+     ref_acc = torch.zeros((n, 1)); ref_cnt = torch.zeros((n, 1))
+     g = torch.Generator().manual_seed(0)
+     views = [(torch.rand((n, 1), generator=g), (torch.rand((n, 1), generator=g) > 0.3).float()) for _ in range(7)]
+@@ -290,6 +291,69 @@ def test_resolve_config():
+             check(True, f"rejects {bad}")
+ 
+ 
++def test_scale_weight_analysis():
++    print("[7] scale-weight diagnostics and plots")
++    import tempfile
++    from utils.scale_weight_stats import scale_weight_analysis, format_summary
++    from utils.sem_logger import SemLogger
++    with open(os.path.join(ROOT, "scene", "gaussian_model.py"), encoding="utf-8") as f:
++        mod = cpu_module(f.read(), "gaussian_model_sw")
++    m = make_model(mod, n=6000, seed=1)
++    n = m.get_xyz.shape[0]
++    g = torch.Generator().manual_seed(5)
++    base = (0.87 + 0.03 * torch.randn((n, 1), generator=g)).clamp(0, 1)                 # similarity concentrated near 0.87
++    radius_true = -6.0 * torch.log(torch.rand((n, 1), generator=g).clamp_min(1e-6))  # px, mostly small, few >= 20px
++    for _ in range(6):                                                   # 6 views, all valid
++        radii = (radius_true + torch.randn((n, 1), generator=g)).clamp_min(0)
++        view = (base + 0.01 * torch.randn((n, 1), generator=g)).clamp(-1, 1)
++        rnorm = ((radii - 1.0) / 19.0).clamp(0, 1)
++        weight = 1.0 - 0.3 * rnorm
++        m.accumulate_similarity((view * weight).clamp(0, 1), torch.ones((n, 1)), radius=radii,
++                                scale_weight=weight, raw_score=view.clamp(0, 1))
++    m.finalize_similarity_score()
++    summary, pts = scale_weight_analysis(m, radius_ref=20.0, max_points=3000)
++    print("   ", format_summary(summary))
++    tr = torch.tensor(summary["transition_weighted_x_unweighted"])
++    check(int(tr.sum()) == summary["n_valid"], "transition matrix covers all valid Gaussians")
++    check(list(tr.sum(dim=1)[1:].tolist()) == summary["weighted"]["counts"], "transition rows = weighted interval counts")
++    check(summary["per_interval_weighted"]["G3"]["frac_large"] is not None and
++          summary["per_interval_weighted"]["G3"]["frac_large"] > summary["frac_large_valid"],
++          "synthetic case: large Gaussians are over-represented in weighted G3")
++    check(summary["g3_only_by_scale_weight"] is not None and summary["g3_only_by_scale_weight"] > 0.5,
++          "synthetic case: most weighted-G3 members are there only because of the scale weight")
++    check(pts is not None and len(pts["radius"]) <= 3000 and set(pts) >= {"similarity", "similarity_raw", "radius",
++          "scale_weight", "interval", "interval_raw", "scale_ratio", "grad"}, "points subsampled with all fields")
++
++    # train_sim_rendersim.save_similarity_scale_statistics_json, extracted without importing CUDA modules
++    with open(os.path.join(ROOT, "train_sim_rendersim.py"), encoding="utf-8") as f:
++        tree = ast.parse(f.read())
++    fn = [nd for nd in tree.body if isinstance(nd, ast.FunctionDef) and nd.name == "save_similarity_scale_statistics_json"]
++    ns = {"os": os, "json": json, "scale_weight_analysis": scale_weight_analysis, "format_summary": format_summary}
++    exec(compile(ast.Module(body=fn, type_ignores=[]), "rendersim_subset", "exec"), ns)
++    import similarity_scale_scatter as sss
++    with tempfile.TemporaryDirectory() as d:
++        ns["save_similarity_scale_statistics_json"](SimpleNamespace(model_path=d), m, 7000, max_points=3000)
++        ns["save_similarity_scale_statistics_json"](SimpleNamespace(model_path=d), m, 7000, max_points=3000)  # same iteration replaced
++        data = json.load(open(os.path.join(d, "similarity_scale_statistics.json")))
++        check(len(data) == 1 and len(data[0]["points"]) <= 3000 and "radius" in data[0]["points"][0],
++              "rendersim json: one record per iteration, new fields present")
++        sss.plot_similarity_scale_scatter(d)
++        files = sorted(os.listdir(os.path.join(d, "similarity_scale_scatter")))
++        check({"007000_radius.png", "007000_raw_vs_weighted.png", "007000_radius_hist.png",
++               "007000_scale_ratio.png", "summary.txt"} <= set(files), f"plots from json: {files}")
++        keep = os.environ.get("KEEP_PLOTS")
++        if keep:
++            import shutil
++            shutil.copytree(os.path.join(d, "similarity_scale_scatter"), keep, dirs_exist_ok=True)
++    with tempfile.TemporaryDirectory() as d:  # train_sim.py path: npz snapshot + sem_log.jsonl summary
++        lg = SemLogger(d, enabled=True)
++        lg.save_arrays("scale_weight", 3000, pts)
++        lg.log_step(3000, {"n_sem": 1}, extra={"scale_weight": summary})
++        sss.plot_similarity_scale_scatter(d)
++        files = sorted(os.listdir(os.path.join(d, "similarity_scale_scatter")))
++        check("003000_raw_vs_weighted.png" in files, "plots from train_sim snapshots + sem_log summary")
++
++
+ if __name__ == "__main__":
+     torch.set_num_threads(4)
+     test_full_step_equivalence()
+@@ -297,5 +361,6 @@ if __name__ == "__main__":
+     test_controls_and_r9()
+     test_maps()
+     test_resolve_config()
++    test_scale_weight_analysis()
+     print("\nALL CHECKS PASSED" if not FAILED else f"\n{len(FAILED)} CHECK(S) FAILED")
+     sys.exit(1 if FAILED else 0)
+diff --git a/train_sim.py b/train_sim.py
+index 913703b..75bfc66 100644
+--- a/train_sim.py
++++ b/train_sim.py
+@@ -24,6 +24,7 @@ from utils.dino_utils import DinoSimilarity ###
+ from utils.percentile_utils import get_priority_top_percent, get_dynamic_priority_top_percent ###
+ from utils.signal_maps import GuidanceMaps, SIGNALS ###
+ from utils.sem_logger import SemLogger ###
++from utils.scale_weight_stats import scale_weight_analysis ###
+ import json ###
+ import time ###
+ import random ###
+@@ -189,6 +190,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                 weighted_view_score = (view_score * scale_weight)
+                 weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
+             else:
++                scale_weight = None
+                 weighted_view_score = view_score.clamp_min(0.0)  # [9] has no scale weight
+ 
+             step = (iteration -1) % 100
+@@ -204,7 +206,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+             # visible_mask = visible_mask * wma_weight
+ 
+             gaussians.accumulate_similarity(weighted_view_score, visible_mask, agg=sem_cfg["view_agg"],
+-                                            radius=radii.detach().float().unsqueeze(1))
++                                            radius=radii.detach().float().unsqueeze(1),
++                                            scale_weight=scale_weight,
++                                            raw_score=(view_score.clamp(0.0, 1.0) if sem_cfg["mode"] == "ours" else None))
+ 
+             if sem_logger.enabled:
+                 shadow_view_score = None
+@@ -276,11 +280,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                     gaussians.finalize_similarity_score(agg=sem_cfg["view_agg"]) ###
+                     step_cfg = dict(sem_cfg["densify"]) ###
+                     step_cfg["want_snapshot"] = sem_logger.wants_snapshot(iteration) ###
++                    sw_summary = None ###
++                    if sem_logger.enabled and sem_cfg["mode"] == "ours": ### scale-weight diagnostics (review item 4), before densification
++                        sw_summary, sw_points = scale_weight_analysis(gaussians, radius_ref=opt.sem_radius_max)
++                        if sw_points is not None and step_cfg["want_snapshot"]:
++                            sem_logger.save_arrays("scale_weight", iteration, sw_points)
+                     step_stats = gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path, sem_cfg=step_cfg)
+                     # opacity reset runs after densification in the same iteration, so the last reset before this step is:
+                     last_reset = ((iteration - 1) // opt.opacity_reset_interval) * opt.opacity_reset_interval ###
+                     sem_logger.log_step(iteration, step_stats, extra={ ###
+-                        "iters_since_opacity_reset": (iteration - last_reset) if last_reset > 0 else None}) ###
++                        "iters_since_opacity_reset": (iteration - last_reset) if last_reset > 0 else None, ###
++                        "scale_weight": sw_summary}) ###
+                     gaussians.reset_similarity_accum() ###
+                     gaussians.reset_similarity_aux() ###
+                 ###
+diff --git a/train_sim_rendersim.py b/train_sim_rendersim.py
+index dcca766..2aa4248 100644
+--- a/train_sim_rendersim.py
++++ b/train_sim_rendersim.py
+@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
+ import matplotlib.cm as cm
+ import json
+ from utils.sh_utils import eval_sh
++from utils.scale_weight_stats import scale_weight_analysis, format_summary ###
+ 
+ try:
+     from torch.utils.tensorboard import SummaryWriter
+@@ -182,7 +183,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+             visible_mask = view_visible_mask * (den_grad > 1e-6)
+             # visible_mask = visible_mask * wma_weight
+ 
+-            gaussians.accumulate_similarity(weighted_view_score, visible_mask)
++            gaussians.accumulate_similarity(weighted_view_score, visible_mask,
++                                            radius=radii.detach().float().unsqueeze(1),
++                                            scale_weight=scale_weight,
++                                            raw_score=view_score.clamp(0.0, 1.0)) ### diagnostics for save_similarity_scale_statistics_json
+             # gaussians.accumulate_similarity(view_score, visible_mask)
+             # save_similarity_statistics_json(scene, gaussians, iteration, weighted_view_score, visible_mask)
+ 
+@@ -1401,43 +1405,48 @@ def save_similarity_scale_statistics_json(
+     scene,
+     gaussians,
+     iteration,
++    radius_ref=20.0,
++    max_points=100_000,
+ ):
+     """
+-    Save similarity score and scale ratio statistics.
++    Save similarity score / projected radius / scale weight statistics (review item 4).
+ 
+-    statistics.json
++    Call after gaussians.finalize_similarity_score() and before densification, so that the
++    accumulators still describe the interval that the selection uses.
+ 
+-    Each iteration stores:
++    similarity_scale_statistics.json is a list of
+     {
+         iteration,
+-        similarity_score[],
+-        scale_ratio[]
++        summary: {...},   # interval counts with / without the scale weight, transition matrix,
++                          # fraction of large Gaussians per interval, "G3 only by scale weight", ...
++        points: [         # strided subsample (max_points) of the valid Gaussians
++            {
++                similarity,      # S_k used for the selection (with scale weight)
++                similarity_raw,  # same views without the scale weight (same [0, 1] clamp)
++                radius,          # mean projected radius over the valid views (px, rasterizer 3-sigma radius)
++                scale_weight,    # mean scale weight over the same views
++                interval,        # 0: >= mean - std, 1..3: G1..G3 from the weighted score
++                interval_raw,    # the same from the unweighted score
++                scale_ratio,     # min / max world scale (kept for the previous plot)
++                grad,            # mean positional gradient of the interval
++            }, ...
++        ]
+     }
++    Requires the training loop to pass radius / scale_weight / raw_score to accumulate_similarity.
+     """
+ 
+-    similarity = gaussians.get_similarity_score.detach().squeeze(1)
+-    valid_mask = gaussians.sim_view_count.detach().squeeze(1) > 0
+-
+-    scaling = gaussians.get_scaling.detach()
+-
+-    max_scale = scaling.max(dim=1).values
+-    min_scale = scaling.min(dim=1).values
+-
+-    scale_ratio = min_scale / (max_scale + 1e-12)
+-
+-    similarity = similarity[valid_mask]
+-    scale_ratio = scale_ratio[valid_mask]
+-
+-    points = []
++    summary, pts = scale_weight_analysis(gaussians, radius_ref=radius_ref, max_points=max_points)
++    if pts is None:
++        print(f"[ITER {iteration}] similarity-scale statistics skipped: {format_summary(summary)}")
++        return
+ 
+-    for sim, ratio in zip(similarity.cpu().tolist(), scale_ratio.cpu().tolist()):
+-        points.append({
+-            "similarity": sim,
+-            "scale_ratio": ratio
+-        })
++    keys = list(pts.keys())
++    columns = [pts[k].tolist() for k in keys]
++    points = [dict(zip(keys, values)) for values in zip(*columns)]
+ 
+     stats_entry = {
+         "iteration": int(iteration),
++        "summary": summary,
+         "points": points
+     }
+ 
+@@ -1456,10 +1465,11 @@ def save_similarity_scale_statistics_json(
+ 
+     data.sort(key=lambda x: x["iteration"])
+ 
++    # compact JSON: with indent=2 a file with 1e5 points per iteration grows several times larger
+     with open(json_path, "w") as f:
+-        json.dump(data, f, indent=2)
++        json.dump(data, f)
+ 
+-    print(f"[ITER {iteration}] Saved similarity-scale statistics.")
++    print(f"[ITER {iteration}] Saved similarity-scale statistics: {format_summary(summary)}")
+ 
+ def save_similarity_statistics_json(
+     scene,
+diff --git a/utils/scale_weight_stats.py b/utils/scale_weight_stats.py
+new file mode 100644
+index 0000000..139b026
+--- /dev/null
++++ b/utils/scale_weight_stats.py
+@@ -0,0 +1,130 @@
++#
++# Scale-weight diagnostics (review item 4).
++#
++# Call at a densification step after GaussianModel.finalize_similarity_score() and before
++# densification. It compares the score used for selection (with the scale weight) with the
++# counterfactual score from the same views without the scale weight, and relates both to the
++# projected radius that the scale weight acts on.
++#
++#   radius        : mean projected radius over the valid views of the interval (px). This is the
++#                   rasterizer radius ceil(3 * sqrt(lambda_max)) of the projected 2D covariance,
++#                   i.e. the quantity normalized by R_min / R_max in the scale weight.
++#   scale_weight  : mean of 1 - lambda_s * clip((R - R_min) / (R_max - R_min), 0, 1) over the same views
++#   similarity_raw: mean of clip(view score, 0, 1) over the same views (no scale weight)
++#   interval      : 0 = valid but >= mean - std, 1..3 = G1..G3 (same definition as the selection),
++#                   computed separately for the weighted and the unweighted score
++#
++# Requires the training loop to pass radius / scale_weight / raw_score to accumulate_similarity.
++# No global RNG is used (subsampling is strided).
++#
++
++import torch
++
++from utils.sem_select import stratified_plan, strided_subsample, spearman, summarize
++
++INTERVALS = ["none", "G1", "G2", "G3"]
++
++
++def interval_labels(score, valid):
++    """-1 for invalid, 0 for valid but >= mean - std, 1..3 for G1..G3."""
++    plan = stratified_plan(score, valid, 1.0)  # the sampling ratio is irrelevant for the masks
++    labels = torch.zeros_like(score, dtype=torch.long)
++    labels[~valid] = -1
++    if plan["masks"] is not None:
++        for i, m in enumerate(plan["masks"], start=1):
++            labels[m] = i
++    return labels, plan
++
++
++@torch.no_grad()
++def scale_weight_analysis(gaussians, radius_ref=20.0, max_points=100_000):
++    """
++    Returns (summary dict, points dict of numpy arrays for a strided subsample of the valid Gaussians).
++    summary is None-filled if the diagnostic accumulators were not fed by the training loop.
++    """
++    count = gaussians.sim_view_count.squeeze(1)
++    score = gaussians.get_similarity_score.squeeze(1).detach()
++    valid = (count > 0) & (score >= 0)
++    n_valid = int(valid.sum().item())
++
++    diag_ok = gaussians._diag_ready(count.shape[0]) and n_valid > 0 and \
++        bool((gaussians.sim_diag_accum[valid, 1] > 0).any().item())
++    if not diag_ok:
++        print("[scale_weight_analysis] diagnostic accumulators are empty: pass radius / scale_weight / raw_score "
++              "to accumulate_similarity in the training loop")
++        return {"n_valid": n_valid, "diag_available": False}, None
++
++    raw = gaussians.get_unweighted_similarity()
++    radius = gaussians.get_mean_projected_radius()
++    weight = gaussians.get_mean_scale_weight()
++    grads = (gaussians.xyz_gradient_accum / (gaussians.denom + 1e-8)).squeeze(1)
++    grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
++    scaling = gaussians.get_scaling.detach()
++    scale_ratio = scaling.min(dim=1).values / (scaling.max(dim=1).values + 1e-12)
++
++    lab_w, plan_w = interval_labels(score, valid)
++    lab_r, plan_r = interval_labels(raw, valid)
++    large = radius >= radius_ref
++
++    # transition[i][j]: Gaussians in interval i with the scale weight and interval j without it
++    lw = lab_w[valid].clamp_min(0)
++    lr = lab_r[valid].clamp_min(0)
++    transition = torch.bincount(lw * 4 + lr, minlength=16).view(4, 4).tolist()
++
++    per_interval = {}
++    for i, name in enumerate(INTERVALS):
++        m = valid & (lab_w == i)
++        n = int(m.sum().item())
++        per_interval[name] = {
++            "n": n,
++            "frac_large": (large[m].float().mean().item() if n else None),
++            "radius": summarize(radius, m),
++            "scale_weight_mean": (weight[m].mean().item() if n else None),
++            "score_drop_mean": ((raw[m] - score[m]).mean().item() if n else None),
++        }
++
++    def only_by_weight(target):
++        """Fraction of weighted interval >= target whose unweighted interval is below target."""
++        m = valid & (lab_w >= target)
++        n = int(m.sum().item())
++        if n == 0:
++            return None
++        return ((lab_r[m] < target).float().mean().item())
++
++    summary = {
++        "diag_available": True,
++        "n_valid": n_valid,
++        "radius_ref": float(radius_ref),
++        "frac_large_valid": large[valid].float().mean().item(),
++        "weighted": {"mean": plan_w["mean"], "std": plan_w["std"], "counts": plan_w["counts"]},
++        "unweighted": {"mean": plan_r["mean"], "std": plan_r["std"], "counts": plan_r["counts"]},
++        "per_interval_weighted": per_interval,
++        "transition_weighted_x_unweighted": transition,   # rows/cols: none, G1, G2, G3
++        "g3_only_by_scale_weight": only_by_weight(3),     # in G3 only because of the scale weight
++        "candidates_only_by_scale_weight": only_by_weight(1),  # in G1..G3 only because of the scale weight
++        "spearman_weighted_vs_radius": spearman(score[valid], radius[valid]),
++        "spearman_unweighted_vs_radius": spearman(raw[valid], radius[valid]),
++    }
++
++    idx = strided_subsample(torch.nonzero(valid, as_tuple=False).squeeze(1), int(max_points))
++    points = {
++        "similarity": score[idx].float().cpu().numpy(),
++        "similarity_raw": raw[idx].float().cpu().numpy(),
++        "radius": radius[idx].float().cpu().numpy(),
++        "scale_weight": weight[idx].float().cpu().numpy(),
++        "interval": lab_w[idx].cpu().numpy(),
++        "interval_raw": lab_r[idx].cpu().numpy(),
++        "scale_ratio": scale_ratio[idx].float().cpu().numpy(),
++        "grad": grads[idx].float().cpu().numpy(),
++    }
++    return summary, points
++
++
++def format_summary(summary):
++    if not summary.get("diag_available"):
++        return "scale-weight diagnostics unavailable"
++    g3 = summary["per_interval_weighted"]["G3"]
++    pct = lambda v: "n/a" if v is None else f"{100 * v:.1f}%"
++    return (f"valid={summary['n_valid']}, large(>= {summary['radius_ref']:g}px)={pct(summary['frac_large_valid'])} | "
++            f"G1/G2/G3 with weight={summary['weighted']['counts']}, without={summary['unweighted']['counts']} | "
++            f"G3 large={pct(g3['frac_large'])}, G3 only by scale weight={pct(summary['g3_only_by_scale_weight'])}")
+diff --git a/utils/sem_logger.py b/utils/sem_logger.py
+index 41a0577..c2d0cee 100644
+--- a/utils/sem_logger.py
++++ b/utils/sem_logger.py
+@@ -63,6 +63,12 @@ class SemLogger:
+             if rho is not None:
+                 self._shadow_corr.append(rho)
+ 
++    def save_arrays(self, prefix, iteration, arrays):
++        """Extra per-Gaussian arrays, e.g. scale-weight diagnostics: sem_snapshots/<prefix>_iter_XXXXX.npz"""
++        if not self.enabled or arrays is None:
++            return
++        np.savez_compressed(os.path.join(self.snapshot_dir, f"{prefix}_iter_{int(iteration):05d}.npz"), **arrays)
++
+     def log_step(self, iteration, stats, extra=None):
+         if not self.enabled:
+             self._reset_interval()
+-- 
+2.43.0
+

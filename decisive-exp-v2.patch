@@ -1,0 +1,2795 @@
+From 217f68213267ee18099e1ae351a9fade4a82c4c2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 15:51:14 +0900
+Subject: [PATCH 1/2] Add decisive-experiment code: guidance-signal swap,
+ selection controls, logging
+
+- Guidance map switch (dino / ssim / l1 / l1_blur) in train_sim.py, same pipeline otherwise
+- Scale weight, rho, radius range and split mode as arguments (sem_* options)
+- Selection controls: random_matched and radius_matched (same count as stratified sampling)
+- [9]-style rule (error score, weighted sum, view max, threshold + 5% cap) for the 2nd round
+- Per-step logging (sem_log.jsonl, snapshots), train time / peak VRAM / #GS, run config
+- eval_maps.py, collect_results.py, run_decisive.sh, CPU equivalence test against 343c470
+
+Defaults reproduce the previous computation; the CPU test checks that densification
+results are bit-identical to 343c470 with the default configuration.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PHmjveU9kNqt1TKBUX99W4
+---
+ DECISIVE_EXPERIMENT.md     |  54 +++++++
+ arguments/__init__.py      |  18 ++-
+ collect_results.py         | 185 +++++++++++++++++++++++
+ eval_maps.py               | 109 ++++++++++++++
+ run_decisive.sh            | 124 +++++++++++++++
+ scene/gaussian_model.py    | 171 +++++++++++++++++++--
+ tests/test_decisive_cpu.py | 301 +++++++++++++++++++++++++++++++++++++
+ train_sim.py               | 189 ++++++++++++++++++++---
+ utils/sem_logger.py        |  94 ++++++++++++
+ utils/sem_select.py        | 206 +++++++++++++++++++++++++
+ utils/signal_maps.py       | 138 +++++++++++++++++
+ 11 files changed, 1560 insertions(+), 29 deletions(-)
+ create mode 100644 DECISIVE_EXPERIMENT.md
+ create mode 100644 collect_results.py
+ create mode 100644 eval_maps.py
+ create mode 100644 run_decisive.sh
+ create mode 100644 tests/test_decisive_cpu.py
+ create mode 100644 utils/sem_logger.py
+ create mode 100644 utils/sem_select.py
+ create mode 100644 utils/signal_maps.py
+
+diff --git a/DECISIVE_EXPERIMENT.md b/DECISIVE_EXPERIMENT.md
+new file mode 100644
+index 0000000..d03ef11
+--- /dev/null
++++ b/DECISIVE_EXPERIMENT.md
+@@ -0,0 +1,54 @@
++# 결정적 실험 (검토 의견 1순위, 3·4순위 대조군 포함)
++
++같은 파이프라인에서 similarity map만 바꾸거나 선택 규칙만 바꾼 조건을 비교하여, LPIPS 개선이 DINOv2 신호에서 오는지, 선택 구조나 가우시안 크기에서 오는지를 분리한다.
++
++## 실험군
++
++1차 실험군은 다음과 같다. 모든 조건은 gradient 집합과의 합집합, ADC clone/split/prune 규칙(`--sem_split adc`)을 공유한다.
++
++- `dino_l03`: DINOv2, λ_s = 0.3 (제안 방법). 기준 조건이며, SSIM을 세 번째 보조 채널로 함께 역투영하여 두 점수의 상관만 기록한다.
++- `ssim_l03`, `l1_l03`: S_π를 SSIM map, 1−L1 map으로 교체한다. semantic 신호가 픽셀 오차보다 나은지 본다.
++- `dino_l0`, `ssim_l0`, `l1_l0`: λ_s = 0. scale weight가 선택을 지배하는지 본다(리뷰 4순위).
++- `rand_matched`: 층화 샘플링과 같은 개수를 유효 후보에서 무작위로 고른다. 가우시안을 더 넣은 효과와 구분한다(리뷰 3순위 b).
++- `radius_matched`: 같은 개수를 투영 반지름 상위에서 고른다. 큰 가우시안 split(Mini-Splatting의 blur split)과 구분한다.
++
++2차(선택) 실험군은 `l1blur_l03`(공간 평활 수준을 맞춘 L1), `dino_viewmin`(view 평균 대신 최악 view), `r9_ssim`·`r9_dino`([9]의 가중 합·view 최대·임계값 0.1·단계당 5% 상한, 재구현), `r9_dino_mean`(가중 합 대신 가중 평균)이다.
++
++## 실행
++
++```bash
++# 1) CPU 검증 (GPU 불필요, 기존 커밋 343c470과 densification 결과가 같은지 확인)
++python tests/test_decisive_cpu.py
++
++# 2) 짧은 동작 확인 (densification 600~1100 구간만)
++python train_sim.py -s datasets/NeRF360/flowers -i images_4 -m output/smoke --eval --disable_viewer \
++  --iterations 1500 --densify_until_iter 1200 --test_iterations -1 \
++  --densify_grad_threshold 0.0002 --sem_sample_ratio 0.3 --sem_log --sem_signal dino --sem_shadow ssim
++
++# 3) 파일럿 (flowers, seed 0)
++SCENES="flowers" SEEDS="0" RHO=0.3 bash run_decisive.sh
++
++# 4) 본 실험 / 결과 취합
++SCENES="flowers treehill garden truck" SEEDS="0 1 2" RHO=0.3 bash run_decisive.sh
++python collect_results.py --root output/decisive
++```
++
++데이터 경로는 `M360_DIR`, `TANDT_DIR`, `DB_DIR`, 출력 경로는 `OUT_ROOT` 환경변수로 바꾼다. DINOv2를 쓰는 조건은 저장소 최상위에 `dinov2/`가 있어야 한다.
++
++**주의.** `RHO`는 보고된 Ours를 만든 ρ 값으로 맞춰야 한다. 커밋 343c470의 코드에는 0.2, 논문에는 0.3으로 적혀 있다. 임계값 τ_g는 스크립트가 0.0002를 명시적으로 넘기므로 `arguments/__init__.py`의 기본값과 무관하다.
++
++## 출력 (`output/decisive/<scene>/<arm>/seed<k>/`)
++
++- `sem_run_config.json`: 전체 옵션, 해석된 설정, seed, git 커밋
++- `train_stats.json`: 학습 시간(테스트·저장 시간 포함), densification 구간 시간, peak VRAM(PyTorch allocator 기준), 최종 #GS
++- `sem_log.jsonl`: densification 단계별 |M_sem|, |M_grad|, 교집합, semantic 단독 수, 구간별 c_m·K_m, clone/split 수, M_sem과 전체 유효 후보의 투영 반지름 분포(R_max 이상 비율), M_sem의 gradient가 τ_g 미만인 비율, clamp 전 음수 점수 비율, shadow 신호와의 Spearman 상관, opacity reset 이후 경과 iteration, [9] 모드의 상한 도달 여부
++- `sem_snapshots/iter_*.npz`: 1000·3000·6000·9000·12000·14900 근처 단계의 가우시안별 점수, gradient, 투영 반지름, 선택 여부 (S_k–ḡ_k 산점도용, 최대 20만 개)
++- `results.json`, `per_view.json`: 기존 `metrics.py` 결과
++- `eval_maps.json`: 테스트 view 렌더의 DINOv2·SSIM·L1 map 평균, 하위 5%·10% 분위수, 고정 임계값 아래 픽셀 비율
++- `output/decisive/_summary/runs.csv`, `summary.csv`: 실행별 결과와 seed 평균±표준편차, 장면 평균(`scene=ALL`)
++
++## 새 옵션 (`arguments/__init__.py`)
++
++`--sem_signal dino|ssim|l1|l1_blur`, `--sem_mode ours|r9`, `--sem_select stratified|random_matched|radius_matched`, `--sem_view_norm auto|mean|sum`, `--sem_view_agg auto|mean|min|max`, `--sem_lambda_scale`, `--sem_radius_min`, `--sem_radius_max`, `--sem_sample_ratio`, `--sem_r9_threshold`, `--sem_r9_cap`, `--sem_blur_sigma`, `--sem_shadow`, `--sem_split adc|mask2`, `--sem_log`, 그리고 `train_sim.py`의 `--seed` (0이면 기존과 같은 고정 seed).
++
++기본값(dino, ours, stratified, adc, shadow 없음)에서는 기존 계산과 같다. ours 모드에서 가중 합(`--sem_view_norm sum`)은 막아 두었다. goodness 점수를 합하면 넓게 덮는 가우시안일수록 잘 복원된 것으로 판정되기 때문이며, 가중 합 비교는 오차 점수를 쓰는 r9 모드에서 한다.
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index 6304b4f..f4d7a32 100644
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -99,7 +99,23 @@ class OptimizationParams(ParamGroup):
+         self.optimizer_type = "default"
+         self.sim_start_iter = 3000 ###
+         self.sim_interval = 10 ###
+-        super().__init__(parser, "Optimization Parameters")  
++        # ---- semantic densification (decisive experiment); defaults = proposed method ----
++        self.sem_signal = "dino"          # guidance map: dino | ssim | l1 | l1_blur
++        self.sem_mode = "ours"            # ours (goodness, scale weight, stratified) | r9 ([9]-style error rule)
++        self.sem_select = "stratified"    # ours mode: stratified | random_matched | radius_matched
++        self.sem_view_norm = "auto"       # within-view aggregation: auto | mean | sum   (auto: ours=mean, r9=sum)
++        self.sem_view_agg = "auto"        # across-view aggregation: auto | mean | min | max (auto: ours=mean, r9=max)
++        self.sem_lambda_scale = 0.3       # lambda_s of the scale weight (0 disables it)
++        self.sem_radius_min = 1.0         # R_min (px)
++        self.sem_radius_max = 20.0        # R_max (px)
++        self.sem_sample_ratio = 0.3       # rho of the stratified sampling
++        self.sem_r9_threshold = 0.1       # r9 mode: error threshold
++        self.sem_r9_cap = 0.05            # r9 mode: max fraction of Gaussians added per step
++        self.sem_blur_sigma = 4.0         # l1_blur: Gaussian blur sigma (px)
++        self.sem_shadow = "none"          # extra signal back-projected through the 3rd aux channel (logging only)
++        self.sem_split = "adc"            # adc (densify_and_split_by_selected_mask) | mask2
++        self.sem_log = False              # write sem_log.jsonl / sem_snapshots
++        super().__init__(parser, "Optimization Parameters")
+ 
+ def get_combined_args(parser : ArgumentParser):
+     cmdlne_string = sys.argv[1:]
+diff --git a/collect_results.py b/collect_results.py
+new file mode 100644
+index 0000000..6ccf308
+--- /dev/null
++++ b/collect_results.py
+@@ -0,0 +1,185 @@
++#
++# Collects the decisive-experiment runs into CSV files.
++#
++# Expected layout:  <root>/<scene>/<arm>/seed<k>/{results.json, train_stats.json, eval_maps.json, sem_log.jsonl}
++#
++# Writes:
++#   <out>/runs.csv     one row per run
++#   <out>/summary.csv  mean / std over seeds per (scene, arm), plus scene="ALL" rows that average the
++#                      per-scene means of each arm (scenes missing for an arm are reported in n_scenes)
++#
++# Usage:  python collect_results.py --root output/decisive [--out output/decisive/_summary]
++#
++
++import argparse
++import csv
++import json
++import math
++import os
++from collections import defaultdict
++
++
++def read_json(path):
++    try:
++        with open(path) as f:
++            return json.load(f)
++    except (OSError, ValueError):
++        return None
++
++
++def latest_method(d):
++    """Pick the 'ours_<iter>' entry with the largest iteration."""
++    if not d:
++        return None, None
++    def it(k):
++        try:
++            return int(k.split("_")[-1])
++        except ValueError:
++            return -1
++    key = max(d.keys(), key=it)
++    return key, d[key]
++
++
++def sem_log_summary(path):
++    if not os.path.exists(path):
++        return {}
++    rows = []
++    with open(path) as f:
++        for line in f:
++            line = line.strip()
++            if line:
++                rows.append(json.loads(line))
++    if not rows:
++        return {}
++
++    def mean_of(vals):
++        vals = [v for v in vals if v is not None]
++        return sum(vals) / len(vals) if vals else None
++
++    return {
++        "log_steps": len(rows),
++        "sum_n_sem": sum(r.get("n_sem", 0) for r in rows),
++        "sum_n_sem_only": sum(r.get("n_sem_only", 0) for r in rows),
++        "sum_n_grad": sum(r.get("n_grad", 0) for r in rows),
++        "mean_sem_radius_frac_ge_rmax": mean_of([(r.get("radius_sem") or {}).get("frac_ge_ref") for r in rows]),
++        "mean_valid_radius_frac_ge_rmax": mean_of([(r.get("radius_valid") or {}).get("frac_ge_ref") for r in rows]),
++        "mean_sem_frac_grad_below_tau": mean_of([r.get("sem_frac_grad_below_tau") for r in rows]),
++        "mean_raw_negative_frac": mean_of([r.get("raw_negative_frac") for r in rows]),
++        "mean_shadow_spearman": mean_of([r.get("shadow_spearman_mean") for r in rows]),
++        "frac_steps_r9_cap_bound": mean_of([float(r["r9_cap_bound"]) for r in rows if "r9_cap_bound" in r]),
++    }
++
++
++def parse_run(run_dir, root):
++    rel = os.path.relpath(run_dir, root).split(os.sep)
++    if len(rel) >= 3:
++        scene, arm, seed = rel[-3], rel[-2], rel[-1]
++    else:
++        scene, arm, seed = "?", os.path.relpath(run_dir, root), "?"
++    seed = seed[4:] if seed.startswith("seed") else seed
++
++    row = {"scene": scene, "arm": arm, "seed": seed, "path": run_dir}
++
++    method, metrics = latest_method(read_json(os.path.join(run_dir, "results.json")))
++    if metrics:
++        row.update({"method": method, "PSNR": metrics.get("PSNR"), "SSIM": metrics.get("SSIM"), "LPIPS": metrics.get("LPIPS")})
++
++    ts = read_json(os.path.join(run_dir, "train_stats.json")) or {}
++    row["num_gaussians_M"] = ts["num_gaussians"] / 1e6 if "num_gaussians" in ts else None
++    row["train_min"] = ts.get("wall_time_min")
++    row["peak_vram_gb"] = ts.get("peak_vram_allocated_gb")
++
++    em = read_json(os.path.join(run_dir, "eval_maps.json"))
++    if em and em.get("methods"):
++        _, m = latest_method(em["methods"])
++        for sig, stats in (m or {}).get("summary", {}).items():
++            for k, v in stats.items():
++                row[f"map_{sig}_{k}"] = v
++
++    row.update(sem_log_summary(os.path.join(run_dir, "sem_log.jsonl")))
++    return row
++
++
++def mean_std(vals):
++    vals = [v for v in vals if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v))]
++    if not vals:
++        return None, None, 0
++    m = sum(vals) / len(vals)
++    s = math.sqrt(sum((v - m) ** 2 for v in vals) / (len(vals) - 1)) if len(vals) > 1 else None
++    return m, s, len(vals)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--root", default="output/decisive")
++    parser.add_argument("--out", default=None)
++    args = parser.parse_args()
++    out_dir = args.out or os.path.join(args.root, "_summary")
++    os.makedirs(out_dir, exist_ok=True)
++
++    runs = []
++    for dirpath, dirnames, filenames in os.walk(args.root):
++        if os.path.abspath(dirpath).startswith(os.path.abspath(out_dir)):
++            continue
++        if "train_stats.json" in filenames or "results.json" in filenames:
++            runs.append(parse_run(dirpath, args.root))
++            dirnames[:] = []  # do not descend into a run folder
++    runs.sort(key=lambda r: (r["scene"], r["arm"], str(r["seed"])))
++    if not runs:
++        print(f"No runs found under {args.root}")
++        return
++
++    keys = []
++    for r in runs:
++        for k in r:
++            if k not in keys:
++                keys.append(k)
++    with open(os.path.join(out_dir, "runs.csv"), "w", newline="") as f:
++        w = csv.DictWriter(f, fieldnames=keys)
++        w.writeheader()
++        w.writerows(runs)
++
++    numeric = [k for k in keys if k not in ("scene", "arm", "seed", "path", "method")]
++    groups = defaultdict(list)
++    for r in runs:
++        groups[(r["scene"], r["arm"])].append(r)
++
++    summary = []
++    for (scene, arm), rs in sorted(groups.items()):
++        row = {"scene": scene, "arm": arm, "n_seeds": len(rs)}
++        for k in numeric:
++            m, s, n = mean_std([r.get(k) for r in rs])
++            row[f"{k}_mean"] = m
++            row[f"{k}_std"] = s
++        summary.append(row)
++
++    by_arm = defaultdict(list)
++    for row in summary:
++        by_arm[row["arm"]].append(row)
++    for arm, rows in sorted(by_arm.items()):
++        row = {"scene": "ALL", "arm": arm, "n_seeds": None, "n_scenes": len(rows)}
++        for k in numeric:
++            m, _, _ = mean_std([r.get(f"{k}_mean") for r in rows])
++            row[f"{k}_mean"] = m
++        summary.append(row)
++
++    skeys = []
++    for r in summary:
++        for k in r:
++            if k not in skeys:
++                skeys.append(k)
++    with open(os.path.join(out_dir, "summary.csv"), "w", newline="") as f:
++        w = csv.DictWriter(f, fieldnames=skeys)
++        w.writeheader()
++        w.writerows(summary)
++
++    print(f"{len(runs)} runs -> {out_dir}/runs.csv, {out_dir}/summary.csv")
++    for row in summary:
++        if row["scene"] == "ALL":
++            lp = row.get("LPIPS_mean")
++            gs = row.get("num_gaussians_M_mean")
++            print(f"  ALL {row['arm']:<16s} scenes={row['n_scenes']}  LPIPS={lp if lp is None else round(lp, 4)}  #GS(M)={gs if gs is None else round(gs, 3)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/eval_maps.py b/eval_maps.py
+new file mode 100644
+index 0000000..3d7e2df
+--- /dev/null
++++ b/eval_maps.py
+@@ -0,0 +1,109 @@
++#
++# Test-view error-map statistics for the decisive experiment ("guided by X, evaluated by Y").
++#
++# For every method folder under <model>/test/ (e.g. ours_30000) and every test view, this computes
++# the DINOv2 cosine, SSIM and 1-L1 goodness maps between the render and the GT and reports
++# lower-tail statistics (mean, 5th / 10th percentile, fraction of pixels below fixed thresholds).
++# Results are written to <model>/eval_maps.json.
++#
++# Usage (run from the repository root so that torch.hub finds dinov2/):
++#   python eval_maps.py -m output/decisive/flowers/dino_l03/seed0 [-m ...]
++#   python eval_maps.py -m <model> --signals ssim l1          # without DINOv2
++#   python eval_maps.py -m <model> --save_maps 3              # also save maps of the first 3 views (.npy)
++#
++
++import argparse
++import json
++import os
++from pathlib import Path
++
++import numpy as np
++import torch
++from PIL import Image
++
++from utils.signal_maps import GuidanceMaps, SIGNALS
++
++# Thresholds on the goodness maps; "frac_below_t" = fraction of pixels with goodness < t.
++THRESHOLDS = {
++    "dino": [0.5, 0.7],
++    "ssim": [0.5, 0.7],
++    "l1": [0.90, 0.95],       # i.e. absolute error > 0.10 / > 0.05
++    "l1_blur": [0.90, 0.95],
++}
++
++
++def load_image(path, device):
++    """[3, H, W] float in [0, 1] (same values as torchvision's to_tensor for 8-bit PNGs)."""
++    arr = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
++    return torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(device)
++
++
++@torch.no_grad()
++def map_stats(gmap, thresholds):
++    v = gmap.flatten().float()
++    out = {"mean": v.mean().item(),
++           "p05": torch.quantile(v, 0.05).item(),
++           "p10": torch.quantile(v, 0.10).item()}
++    for t in thresholds:
++        out[f"frac_below_{t:g}"] = (v < t).float().mean().item()
++    return out
++
++
++def evaluate_model(model_path, guidance, signals, save_maps, device):
++    test_dir = Path(model_path) / "test"
++    if not test_dir.is_dir():
++        print(f"[eval_maps] no test/ folder in {model_path}, skipped")
++        return None
++
++    result = {}
++    for method in sorted(os.listdir(test_dir)):
++        renders_dir = test_dir / method / "renders"
++        gt_dir = test_dir / method / "gt"
++        if not renders_dir.is_dir() or not gt_dir.is_dir():
++            continue
++        names = sorted(os.listdir(renders_dir))
++        per_view = {s: {} for s in signals}
++        for i, name in enumerate(names):
++            render = load_image(renders_dir / name, device)
++            gt = load_image(gt_dir / name, device)
++            for s in signals:
++                gmap = guidance.goodness(s, render, gt)  # [1, H, W]
++                per_view[s][name] = map_stats(gmap, THRESHOLDS[s])
++                if i < save_maps:
++                    out_dir = test_dir / method / "guidance_maps"
++                    out_dir.mkdir(parents=True, exist_ok=True)
++                    np.save(out_dir / f"{Path(name).stem}_{s}.npy", gmap.squeeze(0).half().cpu().numpy())
++
++        summary = {}
++        for s in signals:
++            keys = next(iter(per_view[s].values())).keys() if per_view[s] else []
++            summary[s] = {k: float(np.mean([v[k] for v in per_view[s].values()])) for k in keys}
++        result[method] = {"summary": summary, "per_view": per_view, "num_views": len(names)}
++        print(f"[eval_maps] {model_path} / {method}: " +
++              ", ".join(f"{s} mean={summary[s].get('mean', float('nan')):.4f} p05={summary[s].get('p05', float('nan')):.4f}"
++                        for s in signals))
++
++    with open(Path(model_path) / "eval_maps.json", "w") as f:
++        json.dump({"signals": signals, "thresholds": {s: THRESHOLDS[s] for s in signals}, "methods": result}, f, indent=1)
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Guidance-map statistics on rendered test views")
++    parser.add_argument("--model_paths", "-m", required=True, nargs="+", type=str)
++    parser.add_argument("--signals", nargs="+", default=["dino", "ssim", "l1"], choices=list(SIGNALS))
++    parser.add_argument("--save_maps", type=int, default=0, help="save maps of the first N views as .npy")
++    args = parser.parse_args()
++
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    model_paths = [os.path.abspath(p) for p in args.model_paths]
++    # torch.hub.load("dinov2/", source="local") is resolved relative to the working directory
++    os.chdir(os.path.dirname(os.path.abspath(__file__)))
++
++    guidance = GuidanceMaps(args.signals, device=device)
++    for mp in model_paths:
++        evaluate_model(mp, guidance, args.signals, args.save_maps, device)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/run_decisive.sh b/run_decisive.sh
+new file mode 100644
+index 0000000..17a8a66
+--- /dev/null
++++ b/run_decisive.sh
+@@ -0,0 +1,124 @@
++#!/bin/bash
++# ============================================================
++# Decisive experiment runner (review item 1, plus controls for items 3 and 4)
++#
++#   scenes x arms x seeds  ->  train_sim.py -> render.py -> metrics.py -> eval_maps.py
++#
++# Output: $OUT_ROOT/<scene>/<arm>/seed<k>/
++#   cfg_args, sem_run_config.json, train_stats.json, sem_log.jsonl, sem_snapshots/,
++#   test/ours_30000/{renders,gt}, results.json, per_view.json, eval_maps.json, *.log, command.txt
++# Each stage is skipped when its output already exists, so the script can simply be re-run
++# after an interruption (e.g. a RunPod restart).
++#
++# Usage (from anywhere):
++#   bash run_decisive.sh
++#   SCENES="flowers" SEEDS="0" ARMS="dino_l03 ssim_l03" bash run_decisive.sh
++#   M360_DIR=/workspace/datasets/NeRF360 TANDT_DIR=/workspace/datasets/tandt bash run_decisive.sh
++#
++# Afterwards:  python collect_results.py --root "$OUT_ROOT"
++# ============================================================
++
++set -u
++
++cd "$(dirname "$0")"
++
++# ---------------- paths ----------------
++M360_DIR=${M360_DIR:-datasets/NeRF360}
++TANDT_DIR=${TANDT_DIR:-datasets/tandt}
++DB_DIR=${DB_DIR:-datasets/db}
++OUT_ROOT=${OUT_ROOT:-output/decisive}
++export TORCH_HOME=${TORCH_HOME:-/workspace/.cache/torch}
++
++# ---------------- fixed hyperparameters ----------------
++# Passed explicitly so that the defaults in arguments/__init__.py do not matter.
++TAU_G=${TAU_G:-0.0002}   # positional-gradient threshold (3DGS default)
++RHO=${RHO:-0.3}          # stratified sampling ratio: SET TO THE VALUE USED FOR THE REPORTED "Ours"
++SPLIT=${SPLIT:-adc}      # densify_and_split_by_selected_mask (used for the reported "Ours")
++
++# ---------------- what to run ----------------
++SCENES=${SCENES:-"flowers treehill garden truck"}
++SEEDS=${SEEDS:-"0"}
++ARMS=${ARMS:-"dino_l03 ssim_l03 l1_l03 dino_l0 ssim_l0 l1_l0 rand_matched radius_matched"}
++
++ITER=30000
++COMMON="--eval --disable_viewer --test_iterations -1 --save_iterations $ITER \
++--densify_grad_threshold $TAU_G --sem_sample_ratio $RHO --sem_split $SPLIT --sem_log"
++
++M360_OUTDOOR="bicycle flowers garden stump treehill"
++M360_INDOOR="room counter kitchen bonsai"
++TANDT_SCENES="truck train"
++DB_SCENES="drjohnson playroom"
++
++contains() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
++
++scene_source() {   # prints "<source_path> <image_folder>"
++    local s=$1
++    if contains "$M360_OUTDOOR" "$s"; then echo "$M360_DIR/$s images_4"
++    elif contains "$M360_INDOOR" "$s"; then echo "$M360_DIR/$s images_2"
++    elif contains "$TANDT_SCENES" "$s"; then echo "$TANDT_DIR/$s images"
++    elif contains "$DB_SCENES" "$s"; then echo "$DB_DIR/$s images"
++    else return 1; fi
++}
++
++arm_flags() {
++    case "$1" in
++        # ---- 1st round: signal x scale weight, and selection controls ----
++        dino_l03)       echo "--sem_signal dino --sem_shadow ssim" ;;   # proposed method (+ SSIM shadow for logging)
++        ssim_l03)       echo "--sem_signal ssim" ;;
++        l1_l03)         echo "--sem_signal l1" ;;
++        dino_l0)        echo "--sem_signal dino --sem_lambda_scale 0" ;;
++        ssim_l0)        echo "--sem_signal ssim --sem_lambda_scale 0" ;;
++        l1_l0)          echo "--sem_signal l1 --sem_lambda_scale 0" ;;
++        rand_matched)   echo "--sem_signal dino --sem_select random_matched" ;;   # same count, random
++        radius_matched) echo "--sem_signal dino --sem_select radius_matched" ;;   # same count, largest radius
++        # ---- 2nd round (optional) ----
++        l1blur_l03)     echo "--sem_signal l1_blur" ;;
++        dino_viewmin)   echo "--sem_signal dino --sem_view_agg min" ;;              # view mean vs worst view
++        r9_ssim)        echo "--sem_mode r9 --sem_signal ssim --sem_lambda_scale 0" ;;  # [9]-style rule, 1-SSIM
++        r9_dino)        echo "--sem_mode r9 --sem_signal dino --sem_lambda_scale 0" ;;  # [9]-style rule, 1-cos
++        r9_dino_mean)   echo "--sem_mode r9 --sem_signal dino --sem_lambda_scale 0 --sem_view_norm mean" ;;  # weighted mean vs sum
++        *) return 1 ;;
++    esac
++}
++
++for scene in $SCENES; do
++    src_img=$(scene_source "$scene") || { echo "[decisive] unknown scene: $scene"; exit 1; }
++    read -r SRC IMG <<< "$src_img"
++    if [ ! -d "$SRC" ]; then echo "[decisive] dataset not found: $SRC"; exit 1; fi
++
++    for arm in $ARMS; do
++        flags=$(arm_flags "$arm") || { echo "[decisive] unknown arm: $arm"; exit 1; }
++
++        for seed in $SEEDS; do
++            out="$OUT_ROOT/$scene/$arm/seed$seed"
++            mkdir -p "$out"
++            cmd="python train_sim.py -s $SRC -i $IMG -m $out --seed $seed $COMMON $flags"
++            echo "$cmd" > "$out/command.txt"
++            echo "============================================================"
++            echo "[decisive] $scene / $arm / seed$seed"
++
++            if [ ! -f "$out/train_stats.json" ]; then
++                $cmd > "$out/train.log" 2>&1 || { echo "[decisive] TRAIN FAILED: $out (see train.log)"; continue; }
++            else
++                echo "  train: done, skipped"
++            fi
++
++            if [ ! -d "$out/test/ours_$ITER/renders" ]; then
++                python render.py -m "$out" --iteration $ITER --skip_train > "$out/render.log" 2>&1 \
++                    || { echo "[decisive] RENDER FAILED: $out"; continue; }
++            fi
++
++            if [ ! -f "$out/results.json" ]; then
++                python metrics.py -m "$out" > "$out/metrics.log" 2>&1 \
++                    || { echo "[decisive] METRICS FAILED: $out"; continue; }
++            fi
++
++            if [ ! -f "$out/eval_maps.json" ]; then
++                python eval_maps.py -m "$out" > "$out/eval_maps.log" 2>&1 \
++                    || echo "[decisive] EVAL_MAPS FAILED: $out (metrics are still valid)"
++            fi
++        done
++    done
++done
++
++python collect_results.py --root "$OUT_ROOT"
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index c91fbc6..cfd24b3 100644
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -23,6 +23,23 @@ from utils.graphics_utils import BasicPointCloud
+ from utils.general_utils import strip_symmetric, build_scaling_rotation
+ import json ###
+ import os ###
++from utils.sem_select import (select_stratified, select_random_matched, select_radius_matched,
++                              select_threshold_cap, summarize, strided_subsample) ###
++
++# Default semantic densification config used when densify_and_prune_by_similarity is called
++# without sem_cfg (e.g. train_sim_rendersim.py). It reproduces the behaviour of commit 343c470.
++DEFAULT_SEM_CFG = {
++    "mode": "ours",            # ours | r9
++    "select": "stratified",    # stratified | random_matched | radius_matched  (ours mode)
++    "sample_ratio": 0.2,       # rho (343c470 value; train_sim.py passes opt.sem_sample_ratio)
++    "r9_threshold": 0.1,
++    "r9_cap": 0.05,
++    "split": "adc",            # adc | mask2
++    "radius_ref": 20.0,        # R_max, used for the "fraction >= R_max" statistic
++    "collect_stats": False,
++    "want_snapshot": False,
++    "snapshot_max_points": 200_000,
++} ###
+ 
+ try:
+     from diff_gaussian_rasterization import SparseGaussianAdam
+@@ -70,6 +87,7 @@ class GaussianModel:
+         self.sim_score_accum = torch.empty(0) ###
+         self.sim_view_count = torch.empty(0) ###
+         self.similarity_score = torch.empty(0) ###
++        self.sim_radius_accum = torch.empty(0) ### sum of projected radius over valid views (logging, radius control)
+ 
+     def capture(self):
+         return (
+@@ -234,6 +252,7 @@ class GaussianModel:
+         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
++        self.sim_radius_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+ 
+         l = [
+             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+@@ -320,6 +339,8 @@ class GaussianModel:
+         self.sim_score_accum.zero_()
+         self.sim_view_count.zero_()
+         self.similarity_score.zero_()
++        if self.sim_radius_accum.numel() == self.sim_view_count.numel():
++            self.sim_radius_accum.zero_()
+     
+     def reset_similarity_aux(self):
+         with torch.no_grad():
+@@ -383,21 +404,50 @@ class GaussianModel:
+         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
++        self.sim_radius_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+ 
+         self.active_sh_degree = self.max_sh_degree
+ 
+ #####
+-    def accumulate_similarity(self, view_score, visible_mask):
+-        self.sim_score_accum += view_score * visible_mask
++    def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None):
++        """
++        view_score:   [N, 1] weighted view score of the current view
++        visible_mask: [N, 1] float, 1 for valid views (visible and contribution sum > tau_v)
++        agg:          "mean" (proposed; identical to the previous implementation),
++                      "min" (worst view of a goodness score), "max" (worst view of an error score, [9])
++        radius:       [N, 1] projected radius of the current view (optional, for logging / radius control)
++        """
++        if agg == "mean":
++            self.sim_score_accum += view_score * visible_mask
++        elif agg in ("min", "max"):
++            seen = self.sim_view_count > 0
++            reduce_op = torch.minimum if agg == "min" else torch.maximum
++            candidate = torch.where(seen, reduce_op(self.sim_score_accum, view_score), view_score)
++            self.sim_score_accum = torch.where(visible_mask > 0, candidate, self.sim_score_accum)
++        else:
++            raise ValueError(f"Unknown view aggregation: {agg}")
+         self.sim_view_count += visible_mask
++        if radius is not None and self.sim_radius_accum.numel() == self.sim_view_count.numel():
++            self.sim_radius_accum += radius * visible_mask
+         # self.sim_score_accum += view_score
+ 
+-    def finalize_similarity_score(self, eps=1e-8):
+-        self.similarity_score = self.sim_score_accum / (self.sim_view_count)
++    def finalize_similarity_score(self, eps=1e-8, agg="mean"):
++        if agg == "mean":
++            self.similarity_score = self.sim_score_accum / (self.sim_view_count)
++        else:
++            self.similarity_score = torch.where(self.sim_view_count > 0, self.sim_score_accum,
++                                                torch.zeros_like(self.sim_score_accum))
+         # self.similarity_score = self.sim_score_accum / self.denom
+         self.similarity_score[self.similarity_score.isnan()] = 0.0
+         self.similarity_score[self.similarity_score.isinf()] = 0.0
+         return self.similarity_score
++
++    def get_mean_projected_radius(self):
++        """[N] mean projected radius (px) over the valid views of the current interval, 0 if unseen."""
++        count = self.sim_view_count.squeeze(1)
++        if self.sim_radius_accum.numel() != count.numel():
++            return torch.zeros_like(count)
++        return self.sim_radius_accum.squeeze(1) / count.clamp_min(1.0)
+ #####
+ 
+     def replace_tensor_to_optimizer(self, tensor, name):
+@@ -644,6 +694,8 @@ class GaussianModel:
+         self.sim_score_accum = self.sim_score_accum[valid_points_mask] ###
+         self.sim_view_count = self.sim_view_count[valid_points_mask] ###
+         self.similarity_score = self.similarity_score[valid_points_mask] ###
++        if self.sim_radius_accum.numel() == valid_points_mask.numel(): ###
++            self.sim_radius_accum = self.sim_radius_accum[valid_points_mask] ###
+         self._similarity_aux = nn.Parameter(self._similarity_aux[valid_points_mask].detach().requires_grad_(True)) ###
+ 
+ 
+@@ -694,6 +746,8 @@ class GaussianModel:
+         self.sim_score_accum = torch.cat([self.sim_score_accum, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+         self.sim_view_count = torch.cat([self.sim_view_count, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+         self.similarity_score = torch.cat([self.similarity_score, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
++        if self.sim_radius_accum.numel() == self.sim_score_accum.numel() - new_count: ###
++            self.sim_radius_accum = torch.cat([self.sim_radius_accum, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+         self._similarity_aux = nn.Parameter(torch.cat([self._similarity_aux.detach(), torch.zeros((new_count, 3), device="cuda")], dim=0).requires_grad_(True)) ###
+ 
+     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+@@ -1625,8 +1679,24 @@ class GaussianModel:
+ 
+         return semantic_densify_mask
+     
+-    def densify_and_prune_by_similarity(self, max_grad, min_opacity, extent, max_screen_size, radii, iteration, model_path):
+-        
++    def densify_and_prune_by_similarity(self, max_grad, min_opacity, extent, max_screen_size, radii, iteration, model_path, sem_cfg=None):
++        """
++        Union of the gradient set and the semantic set, then the original ADC clone / split / prune.
++
++        sem_cfg (dict, optional; missing keys fall back to DEFAULT_SEM_CFG):
++            mode         "ours": goodness score, selection by `select`
++                         "r9"  : error score, [9]-style threshold + per-step cap
++            select       "stratified" (proposed) | "random_matched" | "radius_matched"
++            sample_ratio rho of the stratified sampling
++            split        "adc" (densify_and_split_by_selected_mask) | "mask2" (principal-axis split, under review)
++        Returns a statistics dict when sem_cfg["collect_stats"] is True, otherwise None.
++        With mode="ours", select="stratified", split="adc" the operations (including the order of
++        random-number calls) are the same as the previous implementation.
++        """
++        cfg = dict(DEFAULT_SEM_CFG)
++        if sem_cfg:
++            cfg.update(sem_cfg)
++
+         grads = self.xyz_gradient_accum / (self.denom + 1e-8)
+         grads[torch.isnan(grads)] = 0.0
+         grads[torch.isinf(grads)] = 0.0
+@@ -1641,13 +1711,42 @@ class GaussianModel:
+         sim_score = self.get_similarity_score.squeeze(1).detach()
+         sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >= 0))
+ 
+-        semantic_densify_mask = self.build_semantic_densify_mask(sim_score, sim_valid_mask, iteration, global_sample_ratio=0.2)
++        select_info = {}
++        if cfg["mode"] == "ours":
++            if cfg["select"] == "stratified":
++                semantic_densify_mask, plan = select_stratified(sim_score, sim_valid_mask, cfg["sample_ratio"])
++            elif cfg["select"] == "random_matched":
++                semantic_densify_mask, plan = select_random_matched(sim_score, sim_valid_mask, cfg["sample_ratio"])
++            elif cfg["select"] == "radius_matched":
++                semantic_densify_mask, plan = select_radius_matched(sim_score, sim_valid_mask, cfg["sample_ratio"],
++                                                                    self.get_mean_projected_radius())
++            else:
++                raise ValueError(f"Unknown semantic selection: {cfg['select']}")
++            select_info = {"score_mean": plan["mean"], "score_std": plan["std"],
++                           "interval_counts": plan["counts"], "interval_samples": plan["num_samples"]}
++        elif cfg["mode"] == "r9":
++            semantic_densify_mask, info = select_threshold_cap(sim_score, sim_valid_mask, cfg["r9_threshold"], cfg["r9_cap"])
++            select_info = {"r9_" + k: v for k, v in info.items()}
++        else:
++            raise ValueError(f"Unknown semantic mode: {cfg['mode']}")
++
+         selected_pts_mask_old = grad_mask | semantic_densify_mask
+ 
++        stats = None
++        if cfg["collect_stats"]:
++            stats = self._semantic_step_stats(grad_mag, grad_mask, sim_score, sim_valid_mask,
++                                              semantic_densify_mask, extent, max_grad, cfg)
++            stats.update(select_info)
++
+         self.tmp_radii = radii
+ 
+         self.densify_and_clone_by_selected_mask(selected_pts_mask_old, extent)
+-        self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)
++        if cfg["split"] == "adc":
++            self.densify_and_split_by_selected_mask(selected_pts_mask_old, extent)
++        elif cfg["split"] == "mask2":
++            self.densify_and_split_by_selected_mask2(gradient_mask_old=grad_mask, semantic_mask_old=semantic_densify_mask, scene_extent=extent, N=2, semantic_offset_ratio=0.75, semantic_minor_scale_ratio=0.8)
++        else:
++            raise ValueError(f"Unknown split mode: {cfg['split']}")
+         # self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
+         # if iteration < 9000:
+         #     self.densify_and_split_by_selected_mask_keep_parent(selected_pts_mask_old, extent)
+@@ -1670,5 +1769,59 @@ class GaussianModel:
+         self.tmp_radii = None
+ 
+         torch.cuda.empty_cache()
+-    
++
++        if stats is not None:
++            stats["n_after"] = int(self.get_xyz.shape[0])
++            stats["n_pruned"] = int(prune_mask.sum().item())
++        return stats
++
++    @torch.no_grad()
++    def _semantic_step_stats(self, grad_mag, grad_mask, sim_score, sim_valid_mask, semantic_mask, extent, max_grad, cfg):
++        """Statistics of one densification step, computed before clone / split (indices = current Gaussians)."""
++        radius_ref = float(cfg["radius_ref"])
++        sem = semantic_mask
++        sem_only = sem & ~grad_mask
++        union = sem | grad_mask
++        small = torch.max(self.get_scaling, dim=1).values <= self.percent_dense * extent
++        radius_mean = self.get_mean_projected_radius()
++
++        n_sem = int(sem.sum().item())
++        stats = {
++            "n_total": int(sim_score.numel()),
++            "n_valid": int(sim_valid_mask.sum().item()),
++            "n_grad": int(grad_mask.sum().item()),
++            "n_sem": n_sem,
++            "n_inter": int((sem & grad_mask).sum().item()),
++            "n_sem_only": int(sem_only.sum().item()),
++            "n_union": int(union.sum().item()),
++            "n_clone_union": int((union & small).sum().item()),
++            "n_split_union": int((union & ~small).sum().item()),
++            "n_clone_sem_only": int((sem_only & small).sum().item()),
++            "n_split_sem_only": int((sem_only & ~small).sum().item()),
++            # fraction of M_sem whose mean positional gradient is below tau_g (review item 5)
++            "sem_frac_grad_below_tau": ((grad_mag[sem] < max_grad).float().mean().item() if n_sem > 0 else None),
++            "radius_valid": summarize(radius_mean, sim_valid_mask, ref=radius_ref),
++            "radius_sem": summarize(radius_mean, sem, ref=radius_ref),
++            "radius_sem_only": summarize(radius_mean, sem_only, ref=radius_ref),
++            "score_valid": summarize(sim_score, sim_valid_mask),
++            "score_sem": summarize(sim_score, sem),
++            "grad_sem": summarize(grad_mag, sem),
++            "grad_valid": summarize(grad_mag, sim_valid_mask),
++        }
++
++        if cfg.get("want_snapshot"):
++            idx = strided_subsample(torch.nonzero(sim_valid_mask, as_tuple=False).squeeze(1),
++                                    int(cfg.get("snapshot_max_points", 200_000)))
++            stats["_snapshot"] = {
++                "score": sim_score[idx].float().cpu().numpy(),
++                "grad": grad_mag[idx].float().cpu().numpy(),
++                "radius_mean": radius_mean[idx].float().cpu().numpy(),
++                "view_count": self.sim_view_count.squeeze(1)[idx].float().cpu().numpy(),
++                "is_sem": sem[idx].cpu().numpy(),
++                "is_grad": grad_mask[idx].cpu().numpy(),
++                "is_small": small[idx].cpu().numpy(),
++                "tau_g": float(max_grad),
++            }
++        return stats
++
+ #####
+diff --git a/tests/test_decisive_cpu.py b/tests/test_decisive_cpu.py
+new file mode 100644
+index 0000000..660c8e7
+--- /dev/null
++++ b/tests/test_decisive_cpu.py
+@@ -0,0 +1,301 @@
++#
++# CPU checks for the decisive-experiment code (no GPU, no CUDA extensions needed).
++#
++#   python tests/test_decisive_cpu.py
++#
++# 1. Full densification step: scene/gaussian_model.py of the reference commit (343c470) vs the
++#    current file, both loaded with "cuda" -> "cpu", same inputs and seed. With the default config
++#    the resulting Gaussians must be bit-identical, also when step statistics/snapshots are on.
++# 2. accumulate_similarity("mean") equals the previous implementation; min/max aggregation.
++# 3. Controls (random_matched / radius_matched) pick exactly sum(K_m) valid Gaussians.
++# 4. [9]-style threshold + cap rule.
++# 5. SSIM map averages to the training SSIM value; l1 / l1_blur ranges.
++# 6. resolve_sem_config validation (parsed from train_sim.py without importing CUDA modules).
++#
++
++import ast
++import json
++import os
++import subprocess
++import sys
++import types
++from types import SimpleNamespace
++
++import numpy as np
++import torch
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, ROOT)
++REFERENCE_COMMIT = "343c470"
++
++# ---- stubs for CUDA-only / optional modules imported by scene/gaussian_model.py ----
++_knn = types.ModuleType("simple_knn")
++_knn_c = types.ModuleType("simple_knn._C")
++_knn_c.distCUDA2 = lambda pts: torch.full((pts.shape[0],), 0.01)
++_knn._C = _knn_c
++sys.modules.setdefault("simple_knn", _knn)
++sys.modules.setdefault("simple_knn._C", _knn_c)
++_ply = types.ModuleType("plyfile")
++_ply.PlyData = object
++_ply.PlyElement = object
++sys.modules.setdefault("plyfile", _ply)
++
++from utils.graphics_utils import BasicPointCloud  # noqa: E402
++from utils import sem_select  # noqa: E402
++from utils.signal_maps import ssim_map, GuidanceMaps  # noqa: E402
++from utils.loss_utils import ssim as train_ssim  # noqa: E402
++
++FAILED = []
++
++
++def check(cond, msg):
++    print(("  ok   " if cond else "  FAIL ") + msg)
++    if not cond:
++        FAILED.append(msg)
++
++
++def _cpu_src(source):
++    return (source.replace("\r\n", "\n").replace('device="cuda"', 'device="cpu"')
++            .replace("device='cuda'", "device='cpu'").replace(".cuda()", ".cpu()"))
++
++
++# utils.general_utils allocates on CUDA (build_rotation, build_scaling_rotation): register a CPU copy
++with open(os.path.join(ROOT, "utils", "general_utils.py"), encoding="utf-8") as _f:
++    _gu = types.ModuleType("utils.general_utils")
++    _gu.__file__ = os.path.join(ROOT, "utils", "general_utils.py")
++    exec(compile(_cpu_src(_f.read()), _gu.__file__, "exec"), _gu.__dict__)
++    sys.modules["utils.general_utils"] = _gu
++
++
++def cpu_module(source, name):
++    src = _cpu_src(source)
++    mod = types.ModuleType(name)
++    mod.__file__ = os.path.join(ROOT, "scene", name + ".py")
++    exec(compile(src, mod.__file__, "exec"), mod.__dict__)
++    return mod
++
++
++def reference_source():
++    try:
++        return subprocess.check_output(["git", "show", f"{REFERENCE_COMMIT}:scene/gaussian_model.py"],
++                                       cwd=ROOT, stderr=subprocess.DEVNULL).decode("utf-8")
++    except Exception:
++        return None
++
++
++TRAIN_ARGS = SimpleNamespace(percent_dense=0.01, position_lr_init=1.6e-4, position_lr_final=1.6e-6,
++                             position_lr_delay_mult=0.01, position_lr_max_steps=30000, feature_lr=0.0025,
++                             opacity_lr=0.025, scaling_lr=0.005, rotation_lr=0.001, exposure_lr_init=0.01,
++                             exposure_lr_final=0.001, exposure_lr_delay_steps=0, exposure_lr_delay_mult=0.0,
++                             iterations=30000)
++
++
++def make_model(mod, n=4000, seed=0):
++    torch.manual_seed(seed)
++    rng = np.random.RandomState(seed)
++    pcd = BasicPointCloud(points=rng.uniform(-1, 1, (n, 3)), colors=rng.uniform(0, 1, (n, 3)),
++                          normals=np.zeros((n, 3)))
++    m = mod.GaussianModel(3)
++    m.create_from_pcd(pcd, [SimpleNamespace(image_name=f"im{i}") for i in range(4)], 1.0)
++    m.training_setup(TRAIN_ARGS)
++    with torch.no_grad():  # spread the sizes so that both clone and split happen
++        m._scaling.copy_(torch.log(torch.exp(torch.empty_like(m._scaling).uniform_(-6.5, -3.0))))
++    # one optimizer step so that Adam states exist (exercises the state-copy paths)
++    for p in [m._xyz, m._features_dc, m._features_rest, m._opacity, m._scaling, m._rotation]:
++        p.grad = torch.randn_like(p) * 1e-3
++    m.optimizer.step()
++    m.optimizer.zero_grad(set_to_none=True)
++    return m
++
++
++def random_step_inputs(n, seed):
++    g = torch.Generator().manual_seed(seed)
++    count = torch.randint(0, 6, (n, 1), generator=g).float()
++    score = torch.rand((n, 1), generator=g) * 0.4 + 0.5
++    score[torch.rand((n, 1), generator=g) < 0.02] *= 0.3          # a low tail
++    return {
++        "xyz_gradient_accum": torch.rand((n, 1), generator=g) * 6e-4 * count,
++        "denom": count.clone(),
++        "sim_score_accum": score * count,
++        "sim_view_count": count,
++        "sim_radius_accum": torch.rand((n, 1), generator=g) * 40 * count,
++        "max_radii2D": torch.rand((n,), generator=g) * 40,
++        "radii": (torch.rand((n,), generator=g) * 40).int(),
++    }
++
++
++def apply_inputs(m, inp):
++    m.xyz_gradient_accum = inp["xyz_gradient_accum"].clone()
++    m.denom = inp["denom"].clone()
++    m.sim_score_accum = inp["sim_score_accum"].clone()
++    m.sim_view_count = inp["sim_view_count"].clone()
++    m.max_radii2D = inp["max_radii2D"].clone()
++    if hasattr(m, "sim_radius_accum") and m.sim_radius_accum.numel() == m.sim_view_count.numel():
++        m.sim_radius_accum = inp["sim_radius_accum"].clone()
++
++
++def model_state(m):
++    return {k: getattr(m, k).detach().clone() for k in
++            ["_xyz", "_features_dc", "_features_rest", "_opacity", "_scaling", "_rotation", "_similarity_aux"]}
++
++
++def test_full_step_equivalence():
++    print("[1] full densification step vs reference commit")
++    ref_src = reference_source()
++    if ref_src is None:
++        print(f"  skip (git history with {REFERENCE_COMMIT} not available)")
++        return
++    old_mod = cpu_module(ref_src, "gaussian_model_ref")
++    with open(os.path.join(ROOT, "scene", "gaussian_model.py"), encoding="utf-8") as f:
++        new_mod = cpu_module(f.read(), "gaussian_model_new")
++
++    for collect in (False, True):
++        old = make_model(old_mod)
++        new = make_model(new_mod)
++        check(all(torch.equal(a, b) for a, b in zip(model_state(old).values(), model_state(new).values())),
++              f"identical initial models (collect_stats={collect})")
++        extent = 2.0
++        for step in range(3):
++            n = old.get_xyz.shape[0]
++            inp = random_step_inputs(n, seed=100 + step)
++            apply_inputs(old, inp)
++            apply_inputs(new, inp)
++
++            torch.manual_seed(1234 + step)
++            old.finalize_similarity_score()
++            old.densify_and_prune_by_similarity(2e-4, 0.005, extent, 20, inp["radii"], 3100 + step * 100, model_path=None)
++
++            torch.manual_seed(1234 + step)
++            new.finalize_similarity_score(agg="mean")
++            stats = new.densify_and_prune_by_similarity(
++                2e-4, 0.005, extent, 20, inp["radii"], 3100 + step * 100, model_path=None,
++                sem_cfg={"sample_ratio": 0.2, "collect_stats": collect, "want_snapshot": collect})
++
++            so, sn = model_state(old), model_state(new)
++            same = all(so[k].shape == sn[k].shape and torch.equal(so[k], sn[k]) for k in so)
++            check(same, f"step {step}: identical Gaussians after densify+prune "
++                        f"(N {n} -> {new.get_xyz.shape[0]}, collect_stats={collect})")
++            check(new.sim_radius_accum.shape[0] == new.get_xyz.shape[0], f"step {step}: sim_radius_accum length tracks N")
++            if collect:
++                check(stats is not None and stats["n_union"] == stats["n_grad"] + stats["n_sem"] - stats["n_inter"],
++                      f"step {step}: stats consistent (n_sem={stats['n_sem']}, n_sem_only={stats['n_sem_only']}, "
++                      f"sem radius>=20 frac={stats['radius_sem'].get('frac_ge_ref')})")
++                check("_snapshot" in stats and len(stats["_snapshot"]["score"]) > 0, f"step {step}: snapshot arrays present")
++            old.reset_similarity_accum()
++            new.reset_similarity_accum()
++
++    # other modes run and keep the bookkeeping consistent
++    for cfg in [{"select": "random_matched"}, {"select": "radius_matched"},
++                {"mode": "r9", "r9_threshold": 0.05}, {"split": "mask2"}]:
++        m = make_model(new_mod)
++        inp = random_step_inputs(m.get_xyz.shape[0], seed=7)
++        apply_inputs(m, inp)
++        m.finalize_similarity_score(agg="max" if cfg.get("mode") == "r9" else "mean")
++        st = m.densify_and_prune_by_similarity(2e-4, 0.005, 2.0, 20, inp["radii"], 3100, model_path=None,
++                                               sem_cfg=dict(cfg, collect_stats=True))
++        ok = all(t.shape[0] == m.get_xyz.shape[0] for t in
++                 [m.sim_score_accum, m.sim_view_count, m.similarity_score, m.sim_radius_accum, m._similarity_aux])
++        check(ok, f"{cfg}: runs, n_sem={st['n_sem']}, state lengths consistent")
++
++
++def test_accumulate():
++    print("[2] accumulate_similarity")
++    with open(os.path.join(ROOT, "scene", "gaussian_model.py"), encoding="utf-8") as f:
++        mod = cpu_module(f.read(), "gaussian_model_acc")
++    m = mod.GaussianModel(3)
++    n = 50
++    m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1)); m.sim_radius_accum = torch.zeros((n, 1))
++    ref_acc = torch.zeros((n, 1)); ref_cnt = torch.zeros((n, 1))
++    g = torch.Generator().manual_seed(0)
++    views = [(torch.rand((n, 1), generator=g), (torch.rand((n, 1), generator=g) > 0.3).float()) for _ in range(7)]
++    for s, v in views:
++        m.accumulate_similarity(s, v, agg="mean", radius=torch.ones((n, 1)) * 3)
++        ref_acc += s * v; ref_cnt += v
++    check(torch.equal(m.sim_score_accum, ref_acc) and torch.equal(m.sim_view_count, ref_cnt), "mean == previous implementation")
++    check(torch.allclose(m.get_mean_projected_radius()[ref_cnt.squeeze(1) > 0], torch.tensor(3.0)), "mean projected radius")
++    for agg, fn in (("min", torch.minimum), ("max", torch.maximum)):
++        m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1))
++        for s, v in views:
++            m.accumulate_similarity(s, v, agg=agg)
++        m.finalize_similarity_score(agg=agg)
++        exp = torch.full((n, 1), float("nan"))
++        for s, v in views:
++            exp = torch.where(v > 0, torch.where(torch.isnan(exp), s, fn(exp, s)), exp)
++        exp = torch.nan_to_num(exp, nan=0.0)
++        check(torch.equal(m.similarity_score, exp), f"{agg} aggregation over valid views")
++
++
++def test_controls_and_r9():
++    print("[3] controls / [4] [9]-style rule")
++    g = torch.Generator().manual_seed(3)
++    score = torch.rand(20000, generator=g) * 0.3 + 0.6
++    score[:300] *= 0.4
++    valid = torch.rand(20000, generator=g) > 0.2
++    radius = torch.rand(20000, generator=g) * 50
++    plan = sem_select.stratified_plan(score, valid, 0.3)
++    k = sum(plan["num_samples"])
++    torch.manual_seed(0); ms, _ = sem_select.select_stratified(score, valid, 0.3)
++    torch.manual_seed(0); mr, _ = sem_select.select_random_matched(score, valid, 0.3)
++    mrad, _ = sem_select.select_radius_matched(score, valid, 0.3, radius)
++    check(int(ms.sum()) == k, f"stratified selects sum(K)={k} (K={plan['num_samples']}, counts={plan['counts']})")
++    check(int(mr.sum()) == k and bool((mr & ~valid).sum() == 0), "random_matched: same count, valid only")
++    check(int(mrad.sum()) == k and bool((mrad & ~valid).sum() == 0), "radius_matched: same count, valid only")
++    thr = radius[mrad].min()
++    check(bool((radius[valid & ~mrad] <= thr).all()), "radius_matched picks the largest radii")
++    err = torch.rand(20000, generator=g)
++    m9, info = sem_select.select_threshold_cap(err, valid, 0.5, 0.05)
++    check(info["cap_bound"] and int(m9.sum()) == int(0.05 * 20000), f"cap binds at 5% ({info})")
++    m9b, info_b = sem_select.select_threshold_cap(err, valid, 0.99, 0.05)
++    check(not info_b["cap_bound"] and int(m9b.sum()) == info_b["n_candidates"], f"below cap keeps all candidates ({info_b})")
++    rho = sem_select.spearman(score, score * 2 + 1)
++    check(rho is not None and abs(rho - 1.0) < 1e-6, "spearman of a monotone transform = 1")
++
++
++def test_maps():
++    print("[5] guidance maps")
++    g = torch.Generator().manual_seed(0)
++    gt = torch.rand((3, 64, 80), generator=g)
++    render = (gt + 0.1 * torch.randn((3, 64, 80), generator=g)).clamp(0, 1)
++    smap = ssim_map(render, gt)
++    check(smap.shape == (1, 64, 80), "ssim map shape [1,H,W]")
++    check(abs(smap.mean().item() - train_ssim(render, gt).item()) < 1e-5, "ssim map mean == training ssim")
++    gm = GuidanceMaps(["ssim", "l1", "l1_blur"], device="cpu")
++    for s in ("ssim", "l1", "l1_blur"):
++        mp = gm.goodness(s, render, gt)
++        check(mp.shape == (1, 64, 80) and mp.max().item() <= 1.0 + 1e-6, f"{s}: shape and upper bound")
++    check(torch.allclose(gm.goodness("l1", gt, gt), torch.ones(1, 64, 80)), "l1 goodness of a perfect render = 1")
++
++
++def test_resolve_config():
++    print("[6] resolve_sem_config")
++    with open(os.path.join(ROOT, "train_sim.py"), encoding="utf-8") as f:
++        tree = ast.parse(f.read())
++    keep = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "resolve_sem_config"
++            or isinstance(n, ast.Assign) and any(getattr(t, "id", "").startswith("SEM_") for t in n.targets)]
++    ns = {"json": json, "SIGNALS": ("dino", "ssim", "l1", "l1_blur")}
++    exec(compile(ast.Module(body=keep, type_ignores=[]), "train_sim_subset", "exec"), ns)
++    base = dict(sem_mode="ours", sem_signal="dino", sem_shadow="none", sem_select="stratified", sem_split="adc",
++                sem_view_norm="auto", sem_view_agg="auto", sem_sample_ratio=0.3, sem_r9_threshold=0.1, sem_r9_cap=0.05,
++                sem_radius_max=20.0, sem_lambda_scale=0.3, sem_log=False)
++    cfg = ns["resolve_sem_config"](SimpleNamespace(**base))
++    check(cfg["view_norm"] == "mean" and cfg["view_agg"] == "mean", "ours: auto -> mean / mean")
++    cfg = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_mode="r9", sem_lambda_scale=0.0)))
++    check(cfg["view_norm"] == "sum" and cfg["view_agg"] == "max", "r9: auto -> sum / max")
++    for bad in [dict(sem_view_norm="sum"), dict(sem_view_agg="max"), dict(sem_signal="vgg"),
++                dict(sem_mode="r9", sem_select="radius_matched")]:
++        try:
++            ns["resolve_sem_config"](SimpleNamespace(**dict(base, **bad)))
++            check(False, f"rejects {bad}")
++        except ValueError:
++            check(True, f"rejects {bad}")
++
++
++if __name__ == "__main__":
++    torch.set_num_threads(4)
++    test_full_step_equivalence()
++    test_accumulate()
++    test_controls_and_r9()
++    test_maps()
++    test_resolve_config()
++    print("\nALL CHECKS PASSED" if not FAILED else f"\n{len(FAILED)} CHECK(S) FAILED")
++    sys.exit(1 if FAILED else 0)
+diff --git a/train_sim.py b/train_sim.py
+index 84e27d6..913703b 100644
+--- a/train_sim.py
++++ b/train_sim.py
+@@ -22,6 +22,13 @@ from tqdm import tqdm
+ from utils.image_utils import psnr
+ from utils.dino_utils import DinoSimilarity ###
+ from utils.percentile_utils import get_priority_top_percent, get_dynamic_priority_top_percent ###
++from utils.signal_maps import GuidanceMaps, SIGNALS ###
++from utils.sem_logger import SemLogger ###
++import json ###
++import time ###
++import random ###
++import subprocess ###
++import numpy as np ###
+ from argparse import ArgumentParser, Namespace
+ from arguments import ModelParams, PipelineParams, OptimizationParams
+ import torchvision.utils as vutils
+@@ -45,17 +52,22 @@ try:
+ except:
+     SPARSE_ADAM_AVAILABLE = False
+ 
+-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
++def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, run_info=None):
+ 
+     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
+         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
+ 
++    sem_cfg = resolve_sem_config(opt) ###
++
+     first_iter = 0
+     tb_writer = prepare_output_and_logger(dataset)
+     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+     scene = Scene(dataset, gaussians)
+-    dino_sim = DinoSimilarity(model_name="dinov2_vits14", device="cuda")
++    # Created at the same point as the previous DinoSimilarity, so a dino run consumes the RNG identically.
++    guidance = GuidanceMaps([sem_cfg["signal"], sem_cfg["shadow"]], device="cuda", blur_sigma=opt.sem_blur_sigma) ###
+     gaussians.training_setup(opt)
++    sem_logger = SemLogger(scene.model_path, enabled=opt.sem_log) ###
++    save_run_config(scene.model_path, dataset, opt, pipe, sem_cfg, run_info) ###
+     priority_cutoff = None
+     if checkpoint:
+         (model_params, first_iter) = torch.load(checkpoint)
+@@ -77,6 +89,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+     ema_loss_for_log = 0.0
+     ema_Ll1depth_for_log = 0.0
+ 
++    torch.cuda.reset_peak_memory_stats() ###
++    t_train_start = time.time() ###
++    t_densify_end = None ###
++
+     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+     first_iter += 1
+     for iteration in range(first_iter, opt.iterations + 1):
+@@ -134,9 +150,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+         if do_similarity:
+             with torch.no_grad():
+                 gt_image = viewpoint_cam.original_image.cuda()
+-                img_bchw = image.unsqueeze(0)
+-                gt_bchw = gt_image.unsqueeze(0)
+-                sim_map = dino_sim.cosine_map(img_bchw, gt_bchw).squeeze(0).detach()
++                # [1, H, W] goodness map (dino: same as the previous cosine_map call)
++                sim_map = guidance.goodness(sem_cfg["signal"], image, gt_image)
++                shadow_map = None
++                if sem_cfg["shadow"] != "none":
++                    shadow_map = guidance.goodness(sem_cfg["shadow"], image, gt_image)
++                if sem_cfg["mode"] == "r9":
++                    # [9]-style: back-project an error map instead of a goodness map
++                    sim_map = 1.0 - sim_map
++                    if shadow_map is not None:
++                        shadow_map = 1.0 - shadow_map
+ 
+             if scalar_map.dim() == 4:
+                 scalar_map = scalar_map.squeeze(0)
+@@ -146,17 +169,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+             aux_loss_num = (sim_map * scalar_map[0:1]).sum()
+             aux_den = (torch.ones_like(scalar_map[1:2]) * scalar_map[1:2]).sum()
+             aux_loss = aux_loss_num + aux_den
++            if shadow_map is not None:
++                # 3rd aux channel (otherwise unused): numerator of the shadow signal, same backward pass
++                aux_loss = aux_loss + (shadow_map * scalar_map[2:3]).sum()
+ 
+             aux_grad = torch.autograd.grad(outputs=aux_loss, inputs=gaussians.get_similarity_aux, retain_graph=True, create_graph=False, allow_unused=False)[0]
+             num_grad = aux_grad[:, 0:1].detach()
+             den_grad = aux_grad[:, 1:2].detach()
+ 
+-            view_score = num_grad / (den_grad + 1e-8)
+-            normalized_radius = normalize_projected_radius(radii=radii, min_radius=1.0, max_radius=20.0)
+-            lambda_scale = 0.3
+-            scale_weight = (1.0 - lambda_scale * normalized_radius)
+-            weighted_view_score = (view_score * scale_weight)
+-            weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
++            if sem_cfg["view_norm"] == "mean":
++                view_score = num_grad / (den_grad + 1e-8)     # contribution-weighted mean (proposed)
++            else:
++                view_score = num_grad                          # contribution-weighted sum ([9])
++
++            if sem_cfg["mode"] == "ours":
++                normalized_radius = normalize_projected_radius(radii=radii, min_radius=opt.sem_radius_min, max_radius=opt.sem_radius_max)
++                lambda_scale = opt.sem_lambda_scale
++                scale_weight = (1.0 - lambda_scale * normalized_radius)
++                weighted_view_score = (view_score * scale_weight)
++                weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
++            else:
++                weighted_view_score = view_score.clamp_min(0.0)  # [9] has no scale weight
+ 
+             step = (iteration -1) % 100
+             progress = step / 99.0
+@@ -166,15 +199,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+             view_visible_mask = visibility_filter.float()
+             if view_visible_mask.dim() == 1:
+                 view_visible_mask = view_visible_mask.unsqueeze(1)
+-            
++
+             visible_mask = view_visible_mask * (den_grad > 1e-6)
+             # visible_mask = visible_mask * wma_weight
+ 
+-            gaussians.accumulate_similarity(weighted_view_score, visible_mask)
++            gaussians.accumulate_similarity(weighted_view_score, visible_mask, agg=sem_cfg["view_agg"],
++                                            radius=radii.detach().float().unsqueeze(1))
++
++            if sem_logger.enabled:
++                shadow_view_score = None
++                if shadow_map is not None:
++                    shadow_num = aux_grad[:, 2:3].detach()
++                    shadow_view_score = shadow_num / (den_grad + 1e-8) if sem_cfg["view_norm"] == "mean" else shadow_num
++                sem_logger.observe_view(iteration, view_score, visible_mask, shadow_view_score)
+ 
+         if iteration == opt.densify_until_iter:
+-            del dino_sim
+-            torch.cuda.empty_cache()
++            guidance.release()
++            t_densify_end = time.time()
+ #####
+ 
+         # Loss
+@@ -232,8 +273,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                 ###
+                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+-                    gaussians.finalize_similarity_score() ###
+-                    gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path)
++                    gaussians.finalize_similarity_score(agg=sem_cfg["view_agg"]) ###
++                    step_cfg = dict(sem_cfg["densify"]) ###
++                    step_cfg["want_snapshot"] = sem_logger.wants_snapshot(iteration) ###
++                    step_stats = gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path, sem_cfg=step_cfg)
++                    # opacity reset runs after densification in the same iteration, so the last reset before this step is:
++                    last_reset = ((iteration - 1) // opt.opacity_reset_interval) * opt.opacity_reset_interval ###
++                    sem_logger.log_step(iteration, step_stats, extra={ ###
++                        "iters_since_opacity_reset": (iteration - last_reset) if last_reset > 0 else None}) ###
+                     gaussians.reset_similarity_accum() ###
+                     gaussians.reset_similarity_aux() ###
+                 ###
+@@ -260,6 +307,107 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+         if do_similarity: ###
+             gaussians.reset_similarity_aux() ###
+ 
++    write_train_stats(scene.model_path, gaussians, opt, t_train_start, t_densify_end) ###
++
++###
++SEM_MODES = ("ours", "r9")
++SEM_SELECTS = ("stratified", "random_matched", "radius_matched")
++SEM_SPLITS = ("adc", "mask2")
++
++
++def resolve_sem_config(opt):
++    """Validate the sem_* options and resolve the 'auto' aggregation settings."""
++    mode = opt.sem_mode
++    if mode not in SEM_MODES:
++        raise ValueError(f"--sem_mode must be one of {SEM_MODES}, got '{mode}'")
++    if opt.sem_signal not in SIGNALS:
++        raise ValueError(f"--sem_signal must be one of {SIGNALS}, got '{opt.sem_signal}'")
++    if opt.sem_shadow != "none" and opt.sem_shadow not in SIGNALS:
++        raise ValueError(f"--sem_shadow must be 'none' or one of {SIGNALS}, got '{opt.sem_shadow}'")
++    if opt.sem_select not in SEM_SELECTS:
++        raise ValueError(f"--sem_select must be one of {SEM_SELECTS}, got '{opt.sem_select}'")
++    if opt.sem_split not in SEM_SPLITS:
++        raise ValueError(f"--sem_split must be one of {SEM_SPLITS}, got '{opt.sem_split}'")
++
++    view_norm = opt.sem_view_norm if opt.sem_view_norm != "auto" else ("mean" if mode == "ours" else "sum")
++    view_agg = opt.sem_view_agg if opt.sem_view_agg != "auto" else ("mean" if mode == "ours" else "max")
++    if view_norm not in ("mean", "sum"):
++        raise ValueError(f"--sem_view_norm must be auto|mean|sum, got '{opt.sem_view_norm}'")
++
++    if mode == "ours":
++        # A summed goodness score grows with coverage, i.e. large Gaussians would look "well reconstructed".
++        if view_norm != "mean":
++            raise ValueError("ours mode uses a goodness score; within-view 'sum' is only meaningful for an error score (use --sem_mode r9)")
++        if view_agg not in ("mean", "min"):
++            raise ValueError("ours mode supports --sem_view_agg mean|min (min = worst view of a goodness score)")
++    else:
++        if view_agg not in ("mean", "max"):
++            raise ValueError("r9 mode supports --sem_view_agg mean|max (max = worst view of an error score)")
++        if opt.sem_select != "stratified":
++            raise ValueError("--sem_select applies to ours mode only; r9 mode uses the threshold + cap rule")
++        if opt.sem_lambda_scale != 0.0:
++            print(f"[sem] r9 mode: scale weight is not used (sem_lambda_scale={opt.sem_lambda_scale} ignored)")
++
++    densify_cfg = {
++        "mode": mode,
++        "select": opt.sem_select,
++        "sample_ratio": opt.sem_sample_ratio,
++        "r9_threshold": opt.sem_r9_threshold,
++        "r9_cap": opt.sem_r9_cap,
++        "split": opt.sem_split,
++        "radius_ref": opt.sem_radius_max,
++        "collect_stats": bool(opt.sem_log),
++    }
++    cfg = {"mode": mode, "signal": opt.sem_signal, "shadow": opt.sem_shadow,
++           "view_norm": view_norm, "view_agg": view_agg, "densify": densify_cfg}
++    print(f"[sem] config: {json.dumps(cfg)}")
++    return cfg
++
++
++def _git_commit():
++    try:
++        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
++                                       stderr=subprocess.DEVNULL).decode().strip()
++    except Exception:
++        return None
++
++
++def save_run_config(model_path, dataset, opt, pipe, sem_cfg, run_info):
++    """cfg_args only stores ModelParams, so the full option set is written here."""
++    record = {
++        "dataset": vars(dataset),
++        "opt": vars(opt),
++        "pipe": vars(pipe),
++        "sem_resolved": sem_cfg,
++        "run_info": run_info or {},
++        "git_commit": _git_commit(),
++    }
++    with open(os.path.join(model_path, "sem_run_config.json"), "w") as f:
++        json.dump(record, f, indent=2, default=str)
++
++
++def write_train_stats(model_path, gaussians, opt, t_train_start, t_densify_end):
++    t_end = time.time()
++    stats = {
++        "wall_time_min": (t_end - t_train_start) / 60.0,
++        "densify_phase_min": ((t_densify_end - t_train_start) / 60.0) if t_densify_end else None,
++        "peak_vram_allocated_gb": torch.cuda.max_memory_allocated() / 1024 ** 3,
++        "peak_vram_reserved_gb": torch.cuda.max_memory_reserved() / 1024 ** 3,
++        "num_gaussians": int(gaussians.get_xyz.shape[0]),
++        "iterations": int(opt.iterations),
++        "note": "wall time includes any test evaluation and saving done during training",
++    }
++    with open(os.path.join(model_path, "train_stats.json"), "w") as f:
++        json.dump(stats, f, indent=2)
++    print(f"[sem] train stats: {json.dumps(stats)}")
++
++
++def set_seed(seed):
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    torch.cuda.manual_seed_all(seed)
++
+ ###
+ def normalize_projected_radius(
+     radii,
+@@ -361,19 +509,22 @@ if __name__ == "__main__":
+     parser.add_argument('--disable_viewer', action='store_true', default=False)
+     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+     parser.add_argument("--start_checkpoint", type=str, default = None)
++    parser.add_argument("--seed", type=int, default=0) ### seed 0 reproduces the previous fixed-seed behaviour
+     args = parser.parse_args(sys.argv[1:])
+     args.save_iterations.append(args.iterations)
+-    
++
+     print("Optimizing " + args.model_path)
+ 
+     # Initialize system state (RNG)
+     safe_state(args.quiet)
++    set_seed(args.seed) ### safe_state always seeds 0; re-seed here (nothing consumes the RNG in between)
+ 
+     # Start GUI server, configure and run training
+     if not args.disable_viewer:
+         network_gui.init(args.ip, args.port)
+     torch.autograd.set_detect_anomaly(args.detect_anomaly)
+-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
++    run_info = {"seed": args.seed, "argv": sys.argv} ###
++    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, run_info=run_info)
+ 
+     # All done
+     print("\nTraining complete.")
+diff --git a/utils/sem_logger.py b/utils/sem_logger.py
+new file mode 100644
+index 0000000..41a0577
+--- /dev/null
++++ b/utils/sem_logger.py
+@@ -0,0 +1,94 @@
++#
++# Per-densification-step logging for the semantic densification experiments.
++#
++#   <model_path>/sem_log.jsonl        one JSON line per densification step
++#   <model_path>/sem_snapshots/*.npz   per-Gaussian arrays at a few steps (strided subsample)
++#
++# Per-iteration observations (between two densification steps) are averaged and written
++# together with the step statistics returned by GaussianModel.densify_and_prune_by_similarity.
++# Nothing here uses the global RNG.
++#
++
++import json
++import os
++
++import numpy as np
++import torch
++
++from utils.sem_select import spearman
++
++
++class SemLogger:
++    def __init__(self, model_path, enabled=False, snapshot_iters=(1000, 3000, 6000, 9000, 12000, 14900),
++                 snapshot_max_points=200_000, shadow_every=10):
++        self.enabled = bool(enabled)
++        self.model_path = model_path
++        self.snapshot_iters = set(int(i) for i in snapshot_iters)
++        self.snapshot_max_points = int(snapshot_max_points)
++        self.shadow_every = max(1, int(shadow_every))
++        self.log_path = os.path.join(model_path, "sem_log.jsonl")
++        self.snapshot_dir = os.path.join(model_path, "sem_snapshots")
++        self._reset_interval()
++        if self.enabled:
++            os.makedirs(self.snapshot_dir, exist_ok=True)
++            open(self.log_path, "w").close()  # truncate when a run is restarted
++
++    def _reset_interval(self):
++        self._n_views = 0
++        self._neg_frac_sum = 0.0
++        self._valid_frac_sum = 0.0
++        self._shadow_corr = []
++
++    def wants_snapshot(self, iteration):
++        return self.enabled and int(iteration) in self.snapshot_iters
++
++    @torch.no_grad()
++    def observe_view(self, iteration, raw_view_score, valid_mask, shadow_view_score=None):
++        """
++        raw_view_score: [N, 1] view score before the scale weight and clamp
++        valid_mask:     [N, 1] float, visible and contribution sum > tau_v
++        """
++        if not self.enabled:
++            return
++        valid = valid_mask.squeeze(1) > 0
++        n_valid = int(valid.sum().item())
++        self._n_views += 1
++        self._valid_frac_sum += n_valid / max(1, valid.numel())
++        if n_valid == 0:
++            return
++        raw = raw_view_score.squeeze(1)[valid]
++        self._neg_frac_sum += (raw < 0).float().mean().item()
++        if shadow_view_score is not None and iteration % self.shadow_every == 0:
++            rho = spearman(raw, shadow_view_score.squeeze(1)[valid])
++            if rho is not None:
++                self._shadow_corr.append(rho)
++
++    def log_step(self, iteration, stats, extra=None):
++        if not self.enabled:
++            self._reset_interval()
++            return
++        record = {"iteration": int(iteration)}
++        if self._n_views > 0:
++            record["views_in_interval"] = self._n_views
++            record["raw_negative_frac"] = self._neg_frac_sum / self._n_views
++            record["valid_frac_per_view"] = self._valid_frac_sum / self._n_views
++        if self._shadow_corr:
++            record["shadow_spearman_mean"] = float(np.mean(self._shadow_corr))
++            record["shadow_spearman_n"] = len(self._shadow_corr)
++        if extra:
++            record.update(extra)
++
++        snapshot = None
++        if stats:
++            stats = dict(stats)
++            snapshot = stats.pop("_snapshot", None)
++            record.update(stats)
++
++        with open(self.log_path, "a") as f:
++            f.write(json.dumps(record) + "\n")
++
++        if snapshot is not None:
++            path = os.path.join(self.snapshot_dir, f"iter_{int(iteration):05d}.npz")
++            np.savez_compressed(path, **snapshot)
++
++        self._reset_interval()
+diff --git a/utils/sem_select.py b/utils/sem_select.py
+new file mode 100644
+index 0000000..d0ed35c
+--- /dev/null
++++ b/utils/sem_select.py
+@@ -0,0 +1,206 @@
++#
++# Selection rules for the semantic densification set M_sem.
++#
++# All functions are pure (tensors in, mask + info out) so they can be unit-tested on CPU.
++#
++#   select_stratified       : the proposed distribution-based stratified sampling. This is a
++#                             line-by-line port of GaussianModel.build_semantic_densify_mask
++#                             (same operations, same order of torch.randperm calls), so with the
++#                             same RNG state it returns the same mask.
++#   select_random_matched   : control. Same total count as the stratified plan, drawn uniformly
++#                             at random from the valid candidates.
++#   select_radius_matched   : control. Same total count as the stratified plan, the candidates
++#                             with the largest projected radius (Mini-Splatting "blur split"-like).
++#   select_threshold_cap    : [9]-style rule. Error score above a threshold, at most
++#                             cap_ratio * N per step, keeping the highest scores when capped.
++#
++# Logging helpers (summaries, Spearman) never touch the global RNG: subsampling is strided,
++# so turning logging on or off does not change the training randomness.
++#
++
++import torch
++
++
++# ---------------------------------------------------------------------------
++# Proposed rule
++# ---------------------------------------------------------------------------
++
++def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio):
++    """
++    Interval masks and per-interval sample sizes of the stratified sampling, without sampling.
++
++    Returns a dict:
++        masks        : [mask_high, mask_mid, mask_low]  (G1, G2, G3)
++        counts       : [c1, c2, c3] (int)
++        num_samples  : [K1, K2, K3] (int, 0 for empty intervals)
++        mean, std    : score statistics over the valid candidates (float or None)
++    """
++    plan = {"masks": None, "counts": [0, 0, 0], "num_samples": [0, 0, 0], "mean": None, "std": None}
++
++    if not sim_valid_mask.any():
++        return plan
++
++    sim_valid = sim_score[sim_valid_mask]
++    sim_mean = sim_valid.mean()
++    sim_std = sim_valid.std(unbiased=False)
++    plan["mean"] = sim_mean.item()
++    plan["std"] = sim_std.item()
++
++    mask_high = (sim_valid_mask & (sim_score >= sim_mean - 2.0 * sim_std) & (sim_score < sim_mean - 1.0 * sim_std))
++    mask_mid = (sim_valid_mask & (sim_score >= sim_mean - 3.0 * sim_std) & (sim_score < sim_mean - 2.0 * sim_std))
++    mask_low = (sim_valid_mask & (sim_score < sim_mean - 3.0 * sim_std))
++    masks = [mask_high, mask_mid, mask_low]
++    plan["masks"] = masks
++
++    counts = torch.tensor([m.sum().item() for m in masks], dtype=torch.float32, device=sim_score.device)
++    plan["counts"] = [int(c) for c in counts.tolist()]
++
++    total_candidate = counts.sum()
++    if total_candidate <= 0:
++        return plan
++
++    # Same arithmetic as the original code. The denominator (all Gaussians) cancels out
++    # in the normalization below; it is kept only to reproduce the original floating point ops.
++    region_ratio = counts / sim_score.numel()
++    valid_region = counts > 0
++
++    inv_ratio = torch.zeros_like(region_ratio)
++    inv_ratio[valid_region] = (1.0 / region_ratio[valid_region])
++    if not inv_ratio.sum() > 0:
++        return plan
++    sample_ratio = (inv_ratio / inv_ratio.sum())
++    sample_ratio = (sample_ratio * global_sample_ratio).clamp(max=1.0)
++
++    num_samples = []
++    for mask, ratio in zip(masks, sample_ratio):
++        num_candidate = int(mask.sum().item())
++        if num_candidate == 0:
++            num_samples.append(0)
++            continue
++        num_sample = max(1, int(num_candidate * ratio.item()))
++        num_sample = min(num_sample, num_candidate)
++        num_samples.append(num_sample)
++    plan["num_samples"] = num_samples
++    return plan
++
++
++def select_stratified(sim_score, sim_valid_mask, global_sample_ratio):
++    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio)
++    mask_out = torch.zeros_like(sim_score, dtype=torch.bool)
++    if plan["masks"] is None:
++        return mask_out, plan
++
++    for mask, num_sample in zip(plan["masks"], plan["num_samples"]):
++        if num_sample == 0:
++            continue
++        candidate_indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
++        num_candidate = candidate_indices.numel()
++        perm = torch.randperm(num_candidate, device=sim_score.device)
++        selected_indices = candidate_indices[perm[:num_sample]]
++        mask_out[selected_indices] = True
++    return mask_out, plan
++
++
++# ---------------------------------------------------------------------------
++# Controls (same count as the stratified plan)
++# ---------------------------------------------------------------------------
++
++def select_random_matched(sim_score, sim_valid_mask, global_sample_ratio):
++    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio)
++    mask_out = torch.zeros_like(sim_score, dtype=torch.bool)
++    k_total = int(sum(plan["num_samples"]))
++    if k_total == 0:
++        return mask_out, plan
++    candidate_indices = torch.nonzero(sim_valid_mask, as_tuple=False).squeeze(1)
++    k_total = min(k_total, candidate_indices.numel())
++    perm = torch.randperm(candidate_indices.numel(), device=sim_score.device)
++    mask_out[candidate_indices[perm[:k_total]]] = True
++    return mask_out, plan
++
++
++def select_radius_matched(sim_score, sim_valid_mask, global_sample_ratio, radius):
++    """`radius`: [N] projected radius per Gaussian (mean over the valid views of the interval)."""
++    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio)
++    mask_out = torch.zeros_like(sim_score, dtype=torch.bool)
++    k_total = int(sum(plan["num_samples"]))
++    if k_total == 0:
++        return mask_out, plan
++    candidate_indices = torch.nonzero(sim_valid_mask, as_tuple=False).squeeze(1)
++    k_total = min(k_total, candidate_indices.numel())
++    top = torch.topk(radius[candidate_indices].float(), k_total, largest=True, sorted=False).indices
++    mask_out[candidate_indices[top]] = True
++    return mask_out, plan
++
++
++# ---------------------------------------------------------------------------
++# [9]-style rule
++# ---------------------------------------------------------------------------
++
++def select_threshold_cap(err_score, valid_mask, threshold, cap_ratio):
++    """
++    [9]-style: grow Gaussians whose error exceeds `threshold`, at most cap_ratio * N per step
++    (N = current number of Gaussians), keeping the highest errors when the cap binds.
++    """
++    n_total = err_score.numel()
++    mask_out = torch.zeros_like(err_score, dtype=torch.bool)
++    candidates = valid_mask & (err_score > threshold)
++    n_candidates = int(candidates.sum().item())
++    n_cap = int(cap_ratio * n_total)
++    info = {"n_candidates": n_candidates, "n_cap": n_cap, "cap_bound": False}
++    if n_candidates == 0 or n_cap <= 0:
++        return mask_out, info
++    candidate_indices = torch.nonzero(candidates, as_tuple=False).squeeze(1)
++    if n_candidates > n_cap:
++        info["cap_bound"] = True
++        top = torch.topk(err_score[candidate_indices], n_cap, largest=True, sorted=False).indices
++        candidate_indices = candidate_indices[top]
++    mask_out[candidate_indices] = True
++    return mask_out, info
++
++
++# ---------------------------------------------------------------------------
++# Logging helpers (no global RNG)
++# ---------------------------------------------------------------------------
++
++def strided_subsample(x, max_n):
++    n = x.numel()
++    if n <= max_n:
++        return x
++    step = (n + max_n - 1) // max_n
++    return x[::step]
++
++
++def summarize(values, mask=None, ref=None, max_n=1_000_000):
++    """mean / median / p90 (and fraction >= ref) of `values[mask]`; quantiles on a strided subsample."""
++    v = values if mask is None else values[mask]
++    v = v.float().flatten()
++    out = {"n": int(v.numel())}
++    if v.numel() == 0:
++        return out
++    out["mean"] = v.mean().item()
++    vs = torch.sort(strided_subsample(v, max_n)).values
++    m = vs.numel()
++    out["median"] = vs[(m - 1) // 2].item()
++    out["p90"] = vs[min(m - 1, int(0.9 * (m - 1)))].item()
++    if ref is not None:
++        out["frac_ge_ref"] = (v >= ref).float().mean().item()
++    return out
++
++
++def spearman(a, b, max_n=200_000):
++    """Spearman rank correlation of two 1-D tensors (strided subsample, average ranks not used)."""
++    a = strided_subsample(a.float().flatten(), max_n)
++    b = strided_subsample(b.float().flatten(), max_n)
++    n = a.numel()
++    if n < 3:
++        return None
++    ra = torch.empty_like(a)
++    rb = torch.empty_like(b)
++    ra[torch.argsort(a)] = torch.arange(n, device=a.device, dtype=a.dtype)
++    rb[torch.argsort(b)] = torch.arange(n, device=b.device, dtype=b.dtype)
++    ra = ra - ra.mean()
++    rb = rb - rb.mean()
++    denom = torch.sqrt((ra * ra).sum() * (rb * rb).sum())
++    if denom.item() == 0:
++        return None
++    return ((ra * rb).sum() / denom).item()
+diff --git a/utils/signal_maps.py b/utils/signal_maps.py
+new file mode 100644
+index 0000000..1fe7062
+--- /dev/null
++++ b/utils/signal_maps.py
+@@ -0,0 +1,138 @@
++#
++# Per-pixel guidance maps for the semantic-guided densification experiments.
++#
++# Every map follows the "goodness" convention: higher = better reconstruction.
++# Returned shape is [1, H, W]; maps are computed without grad and detached.
++#
++#   dino    : DINOv2 cosine similarity (existing DinoSimilarity.cosine_map), range [-1, 1]
++#   ssim    : local SSIM map with the same 11x11 Gaussian window (sigma 1.5) and C1/C2 as
++#             the training loss (utils/loss_utils.py), averaged over RGB, range [-1, 1]
++#   l1      : 1 - mean_c |render - gt|, range [0, 1]
++#   l1_blur : 1 - GaussianBlur(mean_c |render - gt|). The blur sigma (default 4.0 px) is
++#             roughly the standard deviation of a 14 px box (14 / sqrt(12) = 4.04), i.e. the
++#             spatial scale of a DINOv2 ViT-S/14 patch. Used to separate "semantic" from
++#             "spatially pooled" effects.
++#
++# For the [9]-style mode the training loop converts these to an error map with
++# error = 1 - goodness (dino, ssim: [0, 2]; l1: the plain L1 error in [0, 1]).
++#
++
++import math
++
++import torch
++import torch.nn.functional as F
++
++from utils.loss_utils import create_window
++
++SIGNALS = ("dino", "ssim", "l1", "l1_blur")
++
++_SSIM_C1 = 0.01 ** 2
++_SSIM_C2 = 0.03 ** 2
++
++
++def ssim_map(img1, img2, window_size=11):
++    """
++    Local SSIM map, identical in window and constants to utils.loss_utils._ssim.
++
++    Args:
++        img1, img2: [B, C, H, W] or [C, H, W]
++    Returns:
++        [B, 1, H, W] (or [1, H, W] for unbatched input), averaged over channels
++    """
++    unbatched = img1.dim() == 3
++    if unbatched:
++        img1 = img1.unsqueeze(0)
++        img2 = img2.unsqueeze(0)
++
++    channel = img1.size(-3)
++    window = create_window(window_size, channel).to(device=img1.device, dtype=img1.dtype)
++    pad = window_size // 2
++
++    mu1 = F.conv2d(img1, window, padding=pad, groups=channel)
++    mu2 = F.conv2d(img2, window, padding=pad, groups=channel)
++    mu1_sq = mu1.pow(2)
++    mu2_sq = mu2.pow(2)
++    mu1_mu2 = mu1 * mu2
++    sigma1_sq = F.conv2d(img1 * img1, window, padding=pad, groups=channel) - mu1_sq
++    sigma2_sq = F.conv2d(img2 * img2, window, padding=pad, groups=channel) - mu2_sq
++    sigma12 = F.conv2d(img1 * img2, window, padding=pad, groups=channel) - mu1_mu2
++
++    smap = ((2 * mu1_mu2 + _SSIM_C1) * (2 * sigma12 + _SSIM_C2)) / \
++           ((mu1_sq + mu2_sq + _SSIM_C1) * (sigma1_sq + sigma2_sq + _SSIM_C2))
++    smap = smap.mean(dim=1, keepdim=True)
++
++    return smap.squeeze(0) if unbatched else smap
++
++
++def gaussian_blur(img_bchw, sigma):
++    """Separable Gaussian blur with zero padding, radius = ceil(3 sigma)."""
++    if sigma <= 0:
++        return img_bchw
++    radius = max(1, int(math.ceil(3.0 * sigma)))
++    x = torch.arange(-radius, radius + 1, device=img_bchw.device, dtype=img_bchw.dtype)
++    k = torch.exp(-(x ** 2) / (2.0 * sigma ** 2))
++    k = k / k.sum()
++    channel = img_bchw.shape[1]
++    kx = k.view(1, 1, 1, -1).repeat(channel, 1, 1, 1)
++    ky = k.view(1, 1, -1, 1).repeat(channel, 1, 1, 1)
++    out = F.conv2d(img_bchw, kx, padding=(0, radius), groups=channel)
++    out = F.conv2d(out, ky, padding=(radius, 0), groups=channel)
++    return out
++
++
++class GuidanceMaps:
++    """
++    Computes the guidance maps named in `names` for a (render, gt) pair.
++
++    DINOv2 is loaded only when "dino" is requested, so ssim/l1 runs do not need
++    the local dinov2/ repository. Loading happens in __init__, at the same point of
++    the training script where DinoSimilarity used to be created, so a dino run keeps
++    the same random-number consumption as the previous code.
++    """
++
++    def __init__(self, names, device="cuda", dino_model="dinov2_vits14", blur_sigma=4.0):
++        self.names = {n for n in names if n and n != "none"}
++        unknown = self.names - set(SIGNALS)
++        if unknown:
++            raise ValueError(f"Unknown guidance signal(s): {sorted(unknown)}; choose from {SIGNALS}")
++        self.device = device
++        self.blur_sigma = float(blur_sigma)
++        self.dino = None
++        if "dino" in self.names:
++            from utils.dino_utils import DinoSimilarity
++            self.dino = DinoSimilarity(model_name=dino_model, device=device)
++
++    @torch.no_grad()
++    def goodness(self, name, render_chw, gt_chw):
++        """
++        Args:
++            render_chw, gt_chw: [3, H, W] in [0, 1]
++        Returns:
++            [1, H, W] goodness map (higher = better)
++        """
++        if name not in self.names:
++            raise ValueError(f"Signal '{name}' was not requested at construction time")
++
++        if name == "dino":
++            if self.dino is None:
++                raise RuntimeError("DINOv2 was released (densification finished) or never loaded")
++            return self.dino.cosine_map(render_chw.unsqueeze(0), gt_chw.unsqueeze(0)).squeeze(0).detach()
++
++        if name == "ssim":
++            return ssim_map(render_chw, gt_chw).detach()
++
++        err = (render_chw - gt_chw).abs().mean(dim=0, keepdim=True)  # [1, H, W]
++        if name == "l1":
++            return (1.0 - err).detach()
++
++        # l1_blur
++        err = gaussian_blur(err.unsqueeze(0), self.blur_sigma).squeeze(0)
++        return (1.0 - err).detach()
++
++    def release(self):
++        """Free DINOv2 after the densification phase (same as the previous `del dino_sim`)."""
++        if self.dino is not None:
++            del self.dino
++            self.dino = None
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
+-- 
+2.43.0
+
+
+From 4c48964eaf8a41e9c9014df38290615ee1ed7d14 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 16:04:32 +0900
+Subject: [PATCH 2/2] Scale-weight diagnostics: projected radius, scale weight
+ and unweighted score
+
+- sim_diag_accum (radius, scale weight, unweighted view score over valid views) replaces
+  sim_radius_accum; fed by train_sim.py and train_sim_rendersim.py
+- utils/scale_weight_stats.py: interval membership with / without the scale weight,
+  transition matrix, fraction of large Gaussians per interval, "G3 only by scale weight"
+- save_similarity_scale_statistics_json records these fields (subsampled, compact JSON)
+- train_sim.py --sem_log adds the summary to sem_log.jsonl and npz snapshots
+- similarity_scale_scatter.py plots similarity vs radius, unweighted vs weighted score,
+  radius distributions, and the previous scale-ratio scatter
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PHmjveU9kNqt1TKBUX99W4
+---
+ DECISIVE_EXPERIMENT.md      |   9 ++
+ scene/gaussian_model.py     |  48 ++++--
+ similarity_scale_scatter.py | 295 +++++++++++++++++++++++++++++-------
+ tests/test_decisive_cpu.py  |  77 +++++++++-
+ train_sim.py                |  14 +-
+ train_sim_rendersim.py      |  64 ++++----
+ utils/scale_weight_stats.py | 130 ++++++++++++++++
+ utils/sem_logger.py         |   6 +
+ 8 files changed, 537 insertions(+), 106 deletions(-)
+ create mode 100644 utils/scale_weight_stats.py
+
+diff --git a/DECISIVE_EXPERIMENT.md b/DECISIVE_EXPERIMENT.md
+index d03ef11..7e79560 100644
+--- a/DECISIVE_EXPERIMENT.md
++++ b/DECISIVE_EXPERIMENT.md
+@@ -52,3 +52,12 @@ python collect_results.py --root output/decisive
+ `--sem_signal dino|ssim|l1|l1_blur`, `--sem_mode ours|r9`, `--sem_select stratified|random_matched|radius_matched`, `--sem_view_norm auto|mean|sum`, `--sem_view_agg auto|mean|min|max`, `--sem_lambda_scale`, `--sem_radius_min`, `--sem_radius_max`, `--sem_sample_ratio`, `--sem_r9_threshold`, `--sem_r9_cap`, `--sem_blur_sigma`, `--sem_shadow`, `--sem_split adc|mask2`, `--sem_log`, 그리고 `train_sim.py`의 `--seed` (0이면 기존과 같은 고정 seed).
+ 
+ 기본값(dino, ours, stratified, adc, shadow 없음)에서는 기존 계산과 같다. ours 모드에서 가중 합(`--sem_view_norm sum`)은 막아 두었다. goodness 점수를 합하면 넓게 덮는 가우시안일수록 잘 복원된 것으로 판정되기 때문이며, 가중 합 비교는 오차 점수를 쓰는 r9 모드에서 한다.
++
++## scale weight 진단 (리뷰 4순위)
++
++scale weight가 큰 가우시안을 G₃로 밀어 넣는지 보기 위해, 각 가우시안에 대해 유효 view 동안의 투영 반지름, scale weight, scale weight를 적용하기 전 점수를 함께 누적한다(`sim_diag_accum`). 투영 반지름은 rasterizer가 투영된 2D 공분산의 최대 고윳값으로 계산하는 3σ 반지름(px)으로, scale weight가 정규화하는 바로 그 값이다. 기존 `scale_ratio`(3D scale의 최소/최대 축 비)는 모양의 길쭉함을 나타낼 뿐 화면에서의 크기와는 다르다.
++
++- `train_sim.py --sem_log`: 매 densification 단계의 `sem_log.jsonl`에 `scale_weight` 요약(가중 전후 구간 개수, 전이 행렬, 구간별 R_max 이상 비율, "scale weight 때문에만 G₃인 비율")을 기록하고, 스냅샷 시점에는 `sem_snapshots/scale_weight_iter_*.npz`를 저장한다.
++- `train_sim_rendersim.py`의 `save_similarity_scale_statistics_json`: 같은 정보를 `similarity_scale_statistics.json`에 기록한다(최대 10만 개 표본, 기존 `similarity`·`scale_ratio` 필드 유지).
++- `python similarity_scale_scatter.py <model_path>`: 두 입력 중 있는 쪽을 읽어 similarity–반지름 산점도, 가중 전–후 점수 산점도, 반지름 분포, 기존 scale ratio 산점도와 `summary.txt`를 만든다.
++
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index cfd24b3..03e529a 100644
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -87,7 +87,9 @@ class GaussianModel:
+         self.sim_score_accum = torch.empty(0) ###
+         self.sim_view_count = torch.empty(0) ###
+         self.similarity_score = torch.empty(0) ###
+-        self.sim_radius_accum = torch.empty(0) ### sum of projected radius over valid views (logging, radius control)
++        # per-Gaussian sums over the valid views of the current interval (diagnostics, radius control):
++        #   [:, 0] projected radius (px), [:, 1] scale weight, [:, 2] unweighted view score (clamped to [0, 1])
++        self.sim_diag_accum = torch.empty(0) ###
+ 
+     def capture(self):
+         return (
+@@ -252,7 +254,7 @@ class GaussianModel:
+         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+-        self.sim_radius_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
++        self.sim_diag_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda") ###
+ 
+         l = [
+             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+@@ -339,8 +341,8 @@ class GaussianModel:
+         self.sim_score_accum.zero_()
+         self.sim_view_count.zero_()
+         self.similarity_score.zero_()
+-        if self.sim_radius_accum.numel() == self.sim_view_count.numel():
+-            self.sim_radius_accum.zero_()
++        if self._diag_ready(self.sim_view_count.shape[0]):
++            self.sim_diag_accum.zero_()
+     
+     def reset_similarity_aux(self):
+         with torch.no_grad():
+@@ -404,18 +406,23 @@ class GaussianModel:
+         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
+-        self.sim_radius_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
++        self.sim_diag_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda") ###
+ 
+         self.active_sh_degree = self.max_sh_degree
+ 
+ #####
+-    def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None):
++    def _diag_ready(self, n):
++        return self.sim_diag_accum.dim() == 2 and self.sim_diag_accum.shape[0] == n
++
++    def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None, scale_weight=None, raw_score=None):
+         """
+         view_score:   [N, 1] weighted view score of the current view
+         visible_mask: [N, 1] float, 1 for valid views (visible and contribution sum > tau_v)
+         agg:          "mean" (proposed; identical to the previous implementation),
+                       "min" (worst view of a goodness score), "max" (worst view of an error score, [9])
+         radius:       [N, 1] projected radius of the current view (optional, for logging / radius control)
++        scale_weight: [N, 1] scale weight applied in the current view (optional, diagnostics)
++        raw_score:    [N, 1] view score before the scale weight, clamped to [0, 1] (optional, diagnostics)
+         """
+         if agg == "mean":
+             self.sim_score_accum += view_score * visible_mask
+@@ -427,8 +434,10 @@ class GaussianModel:
+         else:
+             raise ValueError(f"Unknown view aggregation: {agg}")
+         self.sim_view_count += visible_mask
+-        if radius is not None and self.sim_radius_accum.numel() == self.sim_view_count.numel():
+-            self.sim_radius_accum += radius * visible_mask
++        if self._diag_ready(self.sim_view_count.shape[0]):
++            for col, value in ((0, radius), (1, scale_weight), (2, raw_score)):
++                if value is not None:
++                    self.sim_diag_accum[:, col:col + 1] += value * visible_mask
+         # self.sim_score_accum += view_score
+ 
+     def finalize_similarity_score(self, eps=1e-8, agg="mean"):
+@@ -444,10 +453,21 @@ class GaussianModel:
+ 
+     def get_mean_projected_radius(self):
+         """[N] mean projected radius (px) over the valid views of the current interval, 0 if unseen."""
++        return self._diag_mean(0)
++
++    def get_mean_scale_weight(self):
++        """[N] mean scale weight over the valid views of the current interval, 0 if unseen."""
++        return self._diag_mean(1)
++
++    def get_unweighted_similarity(self):
++        """[N] mean view score without the scale weight (same views, same [0, 1] clamp), 0 if unseen."""
++        return self._diag_mean(2)
++
++    def _diag_mean(self, col):
+         count = self.sim_view_count.squeeze(1)
+-        if self.sim_radius_accum.numel() != count.numel():
++        if not self._diag_ready(count.shape[0]):
+             return torch.zeros_like(count)
+-        return self.sim_radius_accum.squeeze(1) / count.clamp_min(1.0)
++        return self.sim_diag_accum[:, col] / count.clamp_min(1.0)
+ #####
+ 
+     def replace_tensor_to_optimizer(self, tensor, name):
+@@ -694,8 +714,8 @@ class GaussianModel:
+         self.sim_score_accum = self.sim_score_accum[valid_points_mask] ###
+         self.sim_view_count = self.sim_view_count[valid_points_mask] ###
+         self.similarity_score = self.similarity_score[valid_points_mask] ###
+-        if self.sim_radius_accum.numel() == valid_points_mask.numel(): ###
+-            self.sim_radius_accum = self.sim_radius_accum[valid_points_mask] ###
++        if self._diag_ready(valid_points_mask.shape[0]): ###
++            self.sim_diag_accum = self.sim_diag_accum[valid_points_mask] ###
+         self._similarity_aux = nn.Parameter(self._similarity_aux[valid_points_mask].detach().requires_grad_(True)) ###
+ 
+ 
+@@ -746,8 +766,8 @@ class GaussianModel:
+         self.sim_score_accum = torch.cat([self.sim_score_accum, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+         self.sim_view_count = torch.cat([self.sim_view_count, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+         self.similarity_score = torch.cat([self.similarity_score, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
+-        if self.sim_radius_accum.numel() == self.sim_score_accum.numel() - new_count: ###
+-            self.sim_radius_accum = torch.cat([self.sim_radius_accum, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
++        if self._diag_ready(self.sim_score_accum.shape[0] - new_count): ###
++            self.sim_diag_accum = torch.cat([self.sim_diag_accum, torch.zeros((new_count, 3), device="cuda")], dim=0) ###
+         self._similarity_aux = nn.Parameter(torch.cat([self._similarity_aux.detach(), torch.zeros((new_count, 3), device="cuda")], dim=0).requires_grad_(True)) ###
+ 
+     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+diff --git a/similarity_scale_scatter.py b/similarity_scale_scatter.py
+index 71945fc..2968689 100644
+--- a/similarity_scale_scatter.py
++++ b/similarity_scale_scatter.py
+@@ -1,62 +1,243 @@
++#
++# Similarity vs projected radius / scale weight plots (review item 4).
++#
++# Input (either):
++#   <model>/similarity_scale_statistics.json          from train_sim_rendersim.save_similarity_scale_statistics_json
++#   <model>/sem_snapshots/scale_weight_iter_*.npz     from train_sim.py --sem_log (summary taken from sem_log.jsonl)
++#
++# Output: <model>/similarity_scale_scatter/
++#   <iter>_radius.png          similarity (with scale weight) vs projected radius, colored by interval G1..G3
++#   <iter>_raw_vs_weighted.png similarity without vs with the scale weight; the box below the weighted G3
++#                              boundary and right of the unweighted G3 boundary = "G3 only because of the weight"
++#   <iter>_radius_hist.png     projected-radius distribution: all valid / G3 with weight / G3 without weight
++#   <iter>_scale_ratio.png     the previous plot (similarity vs min/max world scale), when available
++#   summary.txt                the per-iteration summary numbers
++#
++# Usage:  python similarity_scale_scatter.py output/flowers_dino
++#
++
++import argparse
++import glob
+ import json
+ import os
++
++import matplotlib
++matplotlib.use("Agg")
+ import matplotlib.pyplot as plt
+ import numpy as np
+ 
+-def plot_similarity_scale_scatter(model_path):
+-
+-    json_path = os.path.join(
+-        model_path,
+-        "similarity_scale_statistics.json"
+-    )
+-
+-    with open(json_path, "r") as f:
+-        data = json.load(f)
+-
+-    save_dir = os.path.join(
+-        model_path,
+-        "similarity_scale_scatter"
+-    )
+-
+-    os.makedirs(save_dir, exist_ok=True)
+-
+-    for record in data:
+-
+-        iteration = record["iteration"]
+-
+-        similarity = [p["similarity"] for p in record["points"]]
+-        scale_ratio = [p["scale_ratio"] for p in record["points"]]
+-
+-        plt.figure(figsize=(6,6))
+-
+-        plt.scatter(
+-            similarity,
+-            scale_ratio,
+-            s=2,
+-            alpha=0.3
+-        )
+-
+-        plt.xlabel("Similarity Score")
+-        plt.ylabel("Scale Ratio (min/max)")
+-        plt.title(f"Iteration {iteration}")
+-
+-        plt.xlim(0,1)
+-        plt.ylim(0,1)
+-
+-        plt.grid(alpha=0.3)
+-
+-        plt.tight_layout()
+-
+-        plt.savefig(
+-            os.path.join(
+-                save_dir,
+-                f"{iteration:06d}.png"
+-            ),
+-            dpi=300
+-        )
+-
+-        plt.close()
+-    print(np.corrcoef(similarity, scale_ratio)[0, 1])
+-    print("Done.")
+-
+-plot_similarity_scale_scatter("output/treehill8_hybrid2/")
+\ No newline at end of file
++# reference palette (dataviz skill): ordinal one-hue ramp for G1..G3, neutral gray for the rest
++SURFACE = "#fcfcfb"
++TEXT = "#0b0b0b"
++TEXT_2 = "#52514e"
++GRID = "#e4e3df"
++NEUTRAL = "#b5b4ae"
++INTERVAL_COLORS = {1: "#6da7ec", 2: "#256abf", 3: "#0d366b"}
++CONTRAST = "#eb6834"     # second categorical slot, used for the "without scale weight" series
++INTERVAL_NAMES = {0: "other valid", 1: "G1", 2: "G2", 3: "G3"}
++
++
++def load_records(model_path):
++    json_path = os.path.join(model_path, "similarity_scale_statistics.json")
++    if os.path.exists(json_path):
++        with open(json_path) as f:
++            data = json.load(f)
++        records = []
++        for rec in data:
++            pts = rec.get("points", [])
++            if not pts:
++                continue
++            keys = pts[0].keys()
++            arrays = {k: np.asarray([p[k] for p in pts]) for k in keys}
++            records.append({"iteration": rec["iteration"], "summary": rec.get("summary"), "points": arrays})
++        return records
++
++    summaries = {}
++    log_path = os.path.join(model_path, "sem_log.jsonl")
++    if os.path.exists(log_path):
++        with open(log_path) as f:
++            for line in f:
++                if line.strip():
++                    r = json.loads(line)
++                    summaries[r["iteration"]] = r.get("scale_weight")
++    records = []
++    for path in sorted(glob.glob(os.path.join(model_path, "sem_snapshots", "scale_weight_iter_*.npz"))):
++        it = int(os.path.basename(path).split("_")[-1].split(".")[0])
++        z = np.load(path)
++        records.append({"iteration": it, "summary": summaries.get(it), "points": {k: z[k] for k in z.files}})
++    return records
++
++
++def style(ax, title, xlabel, ylabel):
++    ax.set_facecolor(SURFACE)
++    ax.set_title(title, color=TEXT, fontsize=11, loc="left")
++    ax.set_xlabel(xlabel, color=TEXT_2)
++    ax.set_ylabel(ylabel, color=TEXT_2)
++    ax.tick_params(colors=TEXT_2, labelsize=9)
++    ax.grid(color=GRID, linewidth=0.8)
++    ax.set_axisbelow(True)
++    for side in ("top", "right"):
++        ax.spines[side].set_visible(False)
++    for side in ("left", "bottom"):
++        ax.spines[side].set_color(GRID)
++
++
++def boundaries(stats):
++    if not stats or stats.get("mean") is None or stats.get("std") is None:
++        return None
++    m, s = stats["mean"], stats["std"]
++    return [m - s, m - 2 * s, m - 3 * s]
++
++
++def save(fig, path):
++    fig.patch.set_facecolor(SURFACE)
++    fig.tight_layout()
++    fig.savefig(path, dpi=200, facecolor=SURFACE)
++    plt.close(fig)
++
++
++def plot_radius(rec, out_dir, r_ref):
++    p, it = rec["points"], rec["iteration"]
++    x, y, lab = p["radius"], p["similarity"], p["interval"]
++    xmax = max(2 * r_ref, float(np.percentile(x, 99.5)))
++    fig, ax = plt.subplots(figsize=(6.4, 4.8))
++    for k in (0, 1, 2, 3):  # draw the rare low intervals last
++        m = lab == k
++        if not m.any():
++            continue
++        ax.scatter(x[m], y[m], s=2 if k == 0 else 4, alpha=0.35 if k == 0 else 0.8, linewidths=0,
++                   color=NEUTRAL if k == 0 else INTERVAL_COLORS[k], label=f"{INTERVAL_NAMES[k]} (n={int(m.sum())})",
++                   rasterized=True)
++    ax.axvline(r_ref, color=TEXT_2, linestyle="--", linewidth=1)
++    ax.text(r_ref, 1.0, f" R_max = {r_ref:g}px", color=TEXT_2, fontsize=8, va="top", transform=ax.get_xaxis_transform())
++    b = boundaries((rec["summary"] or {}).get("weighted"))
++    if b:
++        for v, name in zip(b, ("μ−σ", "μ−2σ", "μ−3σ")):
++            ax.axhline(v, color=GRID, linestyle=":", linewidth=1)
++            ax.text(xmax, v, f"{name} ", color=TEXT_2, fontsize=8, ha="right", va="bottom")
++    ax.set_xlim(0, xmax)
++    style(ax, f"Iteration {it}: similarity (with scale weight) vs projected radius",
++          "mean projected radius over valid views (px)", "similarity score S_k")
++    ax.legend(loc="lower left", fontsize=8, frameon=False, markerscale=3, labelcolor=TEXT,
++              title="n = plotted sample", title_fontsize=8)
++    save(fig, os.path.join(out_dir, f"{it:06d}_radius.png"))
++
++
++def plot_raw_vs_weighted(rec, out_dir, r_ref):
++    p, it = rec["points"], rec["iteration"]
++    x, y, r = p["similarity_raw"], p["similarity"], p["radius"]
++    large = r >= r_ref
++    fig, ax = plt.subplots(figsize=(5.6, 5.6))
++    ax.scatter(x[~large], y[~large], s=2, alpha=0.35, linewidths=0, color=NEUTRAL,
++               label=f"radius < {r_ref:g}px (n={int((~large).sum())})", rasterized=True)
++    ax.scatter(x[large], y[large], s=3, alpha=0.6, linewidths=0, color=INTERVAL_COLORS[2],
++               label=f"radius ≥ {r_ref:g}px (n={int(large.sum())})", rasterized=True)
++    lo = max(-1.0, float(min(np.percentile(x, 0.1), np.percentile(y, 0.1))) - 0.05)  # zoom to the data
++    ax.plot([lo, 1], [lo, 1], color=TEXT_2, linewidth=1, label="no change (y = x)")
++    w_min = float(np.min(p["scale_weight"])) if "scale_weight" in p else None
++    if w_min is not None and w_min < 0.999:
++        ax.plot([lo, 1], [lo * w_min, w_min], color=TEXT_2, linewidth=1, linestyle="--",
++                label=f"largest reduction (y = {w_min:.2f}·x)")
++    s = rec["summary"] or {}
++    bw, br = boundaries(s.get("weighted")), boundaries(s.get("unweighted"))
++    if bw and br:
++        ax.axhline(bw[2], color=CONTRAST, linewidth=1, linestyle=":")
++        ax.axvline(br[2], color=CONTRAST, linewidth=1, linestyle=":")
++        ax.text(lo, bw[2], " G3 boundary (with weight)", color=TEXT_2, fontsize=8, ha="left", va="bottom")
++        ax.text(br[2], 1.0, "G3 boundary (without weight) ", color=TEXT_2, fontsize=8, rotation=90, ha="right", va="top")
++        frac = s.get("g3_only_by_scale_weight")
++        if frac is not None:
++            # the region above y = x is always empty (the weight never raises a score)
++            ax.text(0.03, 0.58, f"G3 only because of\nthe scale weight: {100 * frac:.1f}%", color=TEXT, fontsize=9,
++                    ha="left", va="top", transform=ax.transAxes)
++    ax.set_xlim(lo, 1)
++    ax.set_ylim(lo, 1)
++    style(ax, f"Iteration {it}: score without vs with scale weight",
++          "similarity without scale weight (same views)", "similarity with scale weight S_k")
++    ax.legend(loc="upper left", fontsize=8, frameon=False, markerscale=3, labelcolor=TEXT,
++              title="n = plotted sample", title_fontsize=8)
++    save(fig, os.path.join(out_dir, f"{it:06d}_raw_vs_weighted.png"))
++
++
++def plot_radius_hist(rec, out_dir, r_ref):
++    p, it = rec["points"], rec["iteration"]
++    r = p["radius"]
++    xmax = max(2 * r_ref, float(np.percentile(r, 99.5)))
++    bins = np.linspace(0, xmax, 60)
++    fig, ax = plt.subplots(figsize=(6.4, 4.0))
++    series = [("all valid", np.ones_like(r, dtype=bool), NEUTRAL),
++              ("G3 with scale weight", p["interval"] == 3, INTERVAL_COLORS[3]),
++              ("G3 without scale weight", p["interval_raw"] == 3, CONTRAST)]
++    for name, m, c in series:
++        if m.sum() < 2:
++            continue
++        frac = float((r[m] >= r_ref).mean())
++        ax.hist(np.clip(r[m], 0, xmax), bins=bins, density=True, histtype="step", linewidth=2, color=c,
++                label=f"{name} (n={int(m.sum())}, ≥{r_ref:g}px: {100 * frac:.0f}%)")
++    ax.axvline(r_ref, color=TEXT_2, linestyle="--", linewidth=1)
++    ax.set_xlim(0, xmax)
++    style(ax, f"Iteration {it}: projected radius distribution", "mean projected radius over valid views (px)", "density")
++    ax.legend(fontsize=8, frameon=False, labelcolor=TEXT, title="n = plotted sample", title_fontsize=8)
++    save(fig, os.path.join(out_dir, f"{it:06d}_radius_hist.png"))
++
++
++def plot_scale_ratio(rec, out_dir):
++    p, it = rec["points"], rec["iteration"]
++    fig, ax = plt.subplots(figsize=(5.6, 5.6))
++    ax.scatter(p["similarity"], p["scale_ratio"], s=2, alpha=0.3, linewidths=0, color=INTERVAL_COLORS[2], rasterized=True)
++    ax.set_xlim(0, 1)
++    ax.set_ylim(0, 1)
++    style(ax, f"Iteration {it}", "similarity score S_k", "scale ratio (min/max world scale)")
++    save(fig, os.path.join(out_dir, f"{it:06d}_scale_ratio.png"))
++    return float(np.corrcoef(p["similarity"], p["scale_ratio"])[0, 1])
++
++
++def summary_lines(rec):
++    s = rec["summary"]
++    if not s or not s.get("diag_available"):
++        return [f"[{rec['iteration']}] no summary"]
++    pct = lambda v: "n/a" if v is None else f"{100 * v:.1f}%"
++    g = s["per_interval_weighted"]
++    lines = [f"[{rec['iteration']}] valid={s['n_valid']}  large(>= {s['radius_ref']:g}px)={pct(s['frac_large_valid'])}",
++             f"    G1/G2/G3 with weight    = {s['weighted']['counts']}",
++             f"    G1/G2/G3 without weight = {s['unweighted']['counts']}",
++             f"    large fraction G1/G2/G3 = {pct(g['G1']['frac_large'])} / {pct(g['G2']['frac_large'])} / {pct(g['G3']['frac_large'])}",
++             f"    G3 only by scale weight = {pct(s['g3_only_by_scale_weight'])},  "
++             f"G1..G3 only by scale weight = {pct(s['candidates_only_by_scale_weight'])}",
++             f"    spearman(score, radius) with / without weight = "
++             f"{s['spearman_weighted_vs_radius']} / {s['spearman_unweighted_vs_radius']}",
++             f"    transition (rows: with weight none,G1,G2,G3 / cols: without) = {s['transition_weighted_x_unweighted']}"]
++    return lines
++
++
++def plot_similarity_scale_scatter(model_path, radius_ref=None):
++    records = load_records(model_path)
++    if not records:
++        print(f"No similarity-scale statistics found in {model_path}")
++        return
++    out_dir = os.path.join(model_path, "similarity_scale_scatter")
++    os.makedirs(out_dir, exist_ok=True)
++    lines = []
++    for rec in records:
++        p = rec["points"]
++        r_ref = radius_ref or ((rec["summary"] or {}).get("radius_ref") or 20.0)
++        if "radius" in p:
++            plot_radius(rec, out_dir, r_ref)
++            plot_raw_vs_weighted(rec, out_dir, r_ref)
++            plot_radius_hist(rec, out_dir, r_ref)
++        if "scale_ratio" in p:
++            corr = plot_scale_ratio(rec, out_dir)
++            lines.append(f"[{rec['iteration']}] corr(similarity, scale_ratio) = {corr:.4f}")
++        lines.extend(summary_lines(rec))
++    with open(os.path.join(out_dir, "summary.txt"), "w") as f:
++        f.write("\n".join(lines) + "\n")
++    print("\n".join(lines))
++    print(f"Done: {out_dir}")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("model_path")
++    parser.add_argument("--radius_ref", type=float, default=None, help="R_max line (default: value stored in the summary)")
++    args = parser.parse_args()
++    plot_similarity_scale_scatter(args.model_path, args.radius_ref)
+diff --git a/tests/test_decisive_cpu.py b/tests/test_decisive_cpu.py
+index 660c8e7..5ee7045 100644
+--- a/tests/test_decisive_cpu.py
++++ b/tests/test_decisive_cpu.py
+@@ -118,7 +118,8 @@ def random_step_inputs(n, seed):
+         "denom": count.clone(),
+         "sim_score_accum": score * count,
+         "sim_view_count": count,
+-        "sim_radius_accum": torch.rand((n, 1), generator=g) * 40 * count,
++        "sim_diag_accum": torch.cat([torch.rand((n, 1), generator=g) * 40, torch.rand((n, 1), generator=g) * 0.3 + 0.7,
++                                     score], dim=1) * count,
+         "max_radii2D": torch.rand((n,), generator=g) * 40,
+         "radii": (torch.rand((n,), generator=g) * 40).int(),
+     }
+@@ -130,8 +131,8 @@ def apply_inputs(m, inp):
+     m.sim_score_accum = inp["sim_score_accum"].clone()
+     m.sim_view_count = inp["sim_view_count"].clone()
+     m.max_radii2D = inp["max_radii2D"].clone()
+-    if hasattr(m, "sim_radius_accum") and m.sim_radius_accum.numel() == m.sim_view_count.numel():
+-        m.sim_radius_accum = inp["sim_radius_accum"].clone()
++    if hasattr(m, "sim_diag_accum") and m._diag_ready(m.sim_view_count.shape[0]):
++        m.sim_diag_accum = inp["sim_diag_accum"].clone()
+ 
+ 
+ def model_state(m):
+@@ -175,7 +176,7 @@ def test_full_step_equivalence():
+             same = all(so[k].shape == sn[k].shape and torch.equal(so[k], sn[k]) for k in so)
+             check(same, f"step {step}: identical Gaussians after densify+prune "
+                         f"(N {n} -> {new.get_xyz.shape[0]}, collect_stats={collect})")
+-            check(new.sim_radius_accum.shape[0] == new.get_xyz.shape[0], f"step {step}: sim_radius_accum length tracks N")
++            check(new.sim_diag_accum.shape == (new.get_xyz.shape[0], 3), f"step {step}: sim_diag_accum shape tracks N")
+             if collect:
+                 check(stats is not None and stats["n_union"] == stats["n_grad"] + stats["n_sem"] - stats["n_inter"],
+                       f"step {step}: stats consistent (n_sem={stats['n_sem']}, n_sem_only={stats['n_sem_only']}, "
+@@ -194,7 +195,7 @@ def test_full_step_equivalence():
+         st = m.densify_and_prune_by_similarity(2e-4, 0.005, 2.0, 20, inp["radii"], 3100, model_path=None,
+                                                sem_cfg=dict(cfg, collect_stats=True))
+         ok = all(t.shape[0] == m.get_xyz.shape[0] for t in
+-                 [m.sim_score_accum, m.sim_view_count, m.similarity_score, m.sim_radius_accum, m._similarity_aux])
++                 [m.sim_score_accum, m.sim_view_count, m.similarity_score, m.sim_diag_accum, m._similarity_aux])
+         check(ok, f"{cfg}: runs, n_sem={st['n_sem']}, state lengths consistent")
+ 
+ 
+@@ -204,7 +205,7 @@ def test_accumulate():
+         mod = cpu_module(f.read(), "gaussian_model_acc")
+     m = mod.GaussianModel(3)
+     n = 50
+-    m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1)); m.sim_radius_accum = torch.zeros((n, 1))
++    m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1)); m.sim_diag_accum = torch.zeros((n, 3))
+     ref_acc = torch.zeros((n, 1)); ref_cnt = torch.zeros((n, 1))
+     g = torch.Generator().manual_seed(0)
+     views = [(torch.rand((n, 1), generator=g), (torch.rand((n, 1), generator=g) > 0.3).float()) for _ in range(7)]
+@@ -290,6 +291,69 @@ def test_resolve_config():
+             check(True, f"rejects {bad}")
+ 
+ 
++def test_scale_weight_analysis():
++    print("[7] scale-weight diagnostics and plots")
++    import tempfile
++    from utils.scale_weight_stats import scale_weight_analysis, format_summary
++    from utils.sem_logger import SemLogger
++    with open(os.path.join(ROOT, "scene", "gaussian_model.py"), encoding="utf-8") as f:
++        mod = cpu_module(f.read(), "gaussian_model_sw")
++    m = make_model(mod, n=6000, seed=1)
++    n = m.get_xyz.shape[0]
++    g = torch.Generator().manual_seed(5)
++    base = (0.87 + 0.03 * torch.randn((n, 1), generator=g)).clamp(0, 1)                 # similarity concentrated near 0.87
++    radius_true = -6.0 * torch.log(torch.rand((n, 1), generator=g).clamp_min(1e-6))  # px, mostly small, few >= 20px
++    for _ in range(6):                                                   # 6 views, all valid
++        radii = (radius_true + torch.randn((n, 1), generator=g)).clamp_min(0)
++        view = (base + 0.01 * torch.randn((n, 1), generator=g)).clamp(-1, 1)
++        rnorm = ((radii - 1.0) / 19.0).clamp(0, 1)
++        weight = 1.0 - 0.3 * rnorm
++        m.accumulate_similarity((view * weight).clamp(0, 1), torch.ones((n, 1)), radius=radii,
++                                scale_weight=weight, raw_score=view.clamp(0, 1))
++    m.finalize_similarity_score()
++    summary, pts = scale_weight_analysis(m, radius_ref=20.0, max_points=3000)
++    print("   ", format_summary(summary))
++    tr = torch.tensor(summary["transition_weighted_x_unweighted"])
++    check(int(tr.sum()) == summary["n_valid"], "transition matrix covers all valid Gaussians")
++    check(list(tr.sum(dim=1)[1:].tolist()) == summary["weighted"]["counts"], "transition rows = weighted interval counts")
++    check(summary["per_interval_weighted"]["G3"]["frac_large"] is not None and
++          summary["per_interval_weighted"]["G3"]["frac_large"] > summary["frac_large_valid"],
++          "synthetic case: large Gaussians are over-represented in weighted G3")
++    check(summary["g3_only_by_scale_weight"] is not None and summary["g3_only_by_scale_weight"] > 0.5,
++          "synthetic case: most weighted-G3 members are there only because of the scale weight")
++    check(pts is not None and len(pts["radius"]) <= 3000 and set(pts) >= {"similarity", "similarity_raw", "radius",
++          "scale_weight", "interval", "interval_raw", "scale_ratio", "grad"}, "points subsampled with all fields")
++
++    # train_sim_rendersim.save_similarity_scale_statistics_json, extracted without importing CUDA modules
++    with open(os.path.join(ROOT, "train_sim_rendersim.py"), encoding="utf-8") as f:
++        tree = ast.parse(f.read())
++    fn = [nd for nd in tree.body if isinstance(nd, ast.FunctionDef) and nd.name == "save_similarity_scale_statistics_json"]
++    ns = {"os": os, "json": json, "scale_weight_analysis": scale_weight_analysis, "format_summary": format_summary}
++    exec(compile(ast.Module(body=fn, type_ignores=[]), "rendersim_subset", "exec"), ns)
++    import similarity_scale_scatter as sss
++    with tempfile.TemporaryDirectory() as d:
++        ns["save_similarity_scale_statistics_json"](SimpleNamespace(model_path=d), m, 7000, max_points=3000)
++        ns["save_similarity_scale_statistics_json"](SimpleNamespace(model_path=d), m, 7000, max_points=3000)  # same iteration replaced
++        data = json.load(open(os.path.join(d, "similarity_scale_statistics.json")))
++        check(len(data) == 1 and len(data[0]["points"]) <= 3000 and "radius" in data[0]["points"][0],
++              "rendersim json: one record per iteration, new fields present")
++        sss.plot_similarity_scale_scatter(d)
++        files = sorted(os.listdir(os.path.join(d, "similarity_scale_scatter")))
++        check({"007000_radius.png", "007000_raw_vs_weighted.png", "007000_radius_hist.png",
++               "007000_scale_ratio.png", "summary.txt"} <= set(files), f"plots from json: {files}")
++        keep = os.environ.get("KEEP_PLOTS")
++        if keep:
++            import shutil
++            shutil.copytree(os.path.join(d, "similarity_scale_scatter"), keep, dirs_exist_ok=True)
++    with tempfile.TemporaryDirectory() as d:  # train_sim.py path: npz snapshot + sem_log.jsonl summary
++        lg = SemLogger(d, enabled=True)
++        lg.save_arrays("scale_weight", 3000, pts)
++        lg.log_step(3000, {"n_sem": 1}, extra={"scale_weight": summary})
++        sss.plot_similarity_scale_scatter(d)
++        files = sorted(os.listdir(os.path.join(d, "similarity_scale_scatter")))
++        check("003000_raw_vs_weighted.png" in files, "plots from train_sim snapshots + sem_log summary")
++
++
+ if __name__ == "__main__":
+     torch.set_num_threads(4)
+     test_full_step_equivalence()
+@@ -297,5 +361,6 @@ if __name__ == "__main__":
+     test_controls_and_r9()
+     test_maps()
+     test_resolve_config()
++    test_scale_weight_analysis()
+     print("\nALL CHECKS PASSED" if not FAILED else f"\n{len(FAILED)} CHECK(S) FAILED")
+     sys.exit(1 if FAILED else 0)
+diff --git a/train_sim.py b/train_sim.py
+index 913703b..75bfc66 100644
+--- a/train_sim.py
++++ b/train_sim.py
+@@ -24,6 +24,7 @@ from utils.dino_utils import DinoSimilarity ###
+ from utils.percentile_utils import get_priority_top_percent, get_dynamic_priority_top_percent ###
+ from utils.signal_maps import GuidanceMaps, SIGNALS ###
+ from utils.sem_logger import SemLogger ###
++from utils.scale_weight_stats import scale_weight_analysis ###
+ import json ###
+ import time ###
+ import random ###
+@@ -189,6 +190,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                 weighted_view_score = (view_score * scale_weight)
+                 weighted_view_score = weighted_view_score.clamp(0.0, 1.0)
+             else:
++                scale_weight = None
+                 weighted_view_score = view_score.clamp_min(0.0)  # [9] has no scale weight
+ 
+             step = (iteration -1) % 100
+@@ -204,7 +206,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+             # visible_mask = visible_mask * wma_weight
+ 
+             gaussians.accumulate_similarity(weighted_view_score, visible_mask, agg=sem_cfg["view_agg"],
+-                                            radius=radii.detach().float().unsqueeze(1))
++                                            radius=radii.detach().float().unsqueeze(1),
++                                            scale_weight=scale_weight,
++                                            raw_score=(view_score.clamp(0.0, 1.0) if sem_cfg["mode"] == "ours" else None))
+ 
+             if sem_logger.enabled:
+                 shadow_view_score = None
+@@ -276,11 +280,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                     gaussians.finalize_similarity_score(agg=sem_cfg["view_agg"]) ###
+                     step_cfg = dict(sem_cfg["densify"]) ###
+                     step_cfg["want_snapshot"] = sem_logger.wants_snapshot(iteration) ###
++                    sw_summary = None ###
++                    if sem_logger.enabled and sem_cfg["mode"] == "ours": ### scale-weight diagnostics (review item 4), before densification
++                        sw_summary, sw_points = scale_weight_analysis(gaussians, radius_ref=opt.sem_radius_max)
++                        if sw_points is not None and step_cfg["want_snapshot"]:
++                            sem_logger.save_arrays("scale_weight", iteration, sw_points)
+                     step_stats = gaussians.densify_and_prune_by_similarity(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, iteration, model_path=scene.model_path, sem_cfg=step_cfg)
+                     # opacity reset runs after densification in the same iteration, so the last reset before this step is:
+                     last_reset = ((iteration - 1) // opt.opacity_reset_interval) * opt.opacity_reset_interval ###
+                     sem_logger.log_step(iteration, step_stats, extra={ ###
+-                        "iters_since_opacity_reset": (iteration - last_reset) if last_reset > 0 else None}) ###
++                        "iters_since_opacity_reset": (iteration - last_reset) if last_reset > 0 else None, ###
++                        "scale_weight": sw_summary}) ###
+                     gaussians.reset_similarity_accum() ###
+                     gaussians.reset_similarity_aux() ###
+                 ###
+diff --git a/train_sim_rendersim.py b/train_sim_rendersim.py
+index dcca766..2aa4248 100644
+--- a/train_sim_rendersim.py
++++ b/train_sim_rendersim.py
+@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
+ import matplotlib.cm as cm
+ import json
+ from utils.sh_utils import eval_sh
++from utils.scale_weight_stats import scale_weight_analysis, format_summary ###
+ 
+ try:
+     from torch.utils.tensorboard import SummaryWriter
+@@ -182,7 +183,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+             visible_mask = view_visible_mask * (den_grad > 1e-6)
+             # visible_mask = visible_mask * wma_weight
+ 
+-            gaussians.accumulate_similarity(weighted_view_score, visible_mask)
++            gaussians.accumulate_similarity(weighted_view_score, visible_mask,
++                                            radius=radii.detach().float().unsqueeze(1),
++                                            scale_weight=scale_weight,
++                                            raw_score=view_score.clamp(0.0, 1.0)) ### diagnostics for save_similarity_scale_statistics_json
+             # gaussians.accumulate_similarity(view_score, visible_mask)
+             # save_similarity_statistics_json(scene, gaussians, iteration, weighted_view_score, visible_mask)
+ 
+@@ -1401,43 +1405,48 @@ def save_similarity_scale_statistics_json(
+     scene,
+     gaussians,
+     iteration,
++    radius_ref=20.0,
++    max_points=100_000,
+ ):
+     """
+-    Save similarity score and scale ratio statistics.
++    Save similarity score / projected radius / scale weight statistics (review item 4).
+ 
+-    statistics.json
++    Call after gaussians.finalize_similarity_score() and before densification, so that the
++    accumulators still describe the interval that the selection uses.
+ 
+-    Each iteration stores:
++    similarity_scale_statistics.json is a list of
+     {
+         iteration,
+-        similarity_score[],
+-        scale_ratio[]
++        summary: {...},   # interval counts with / without the scale weight, transition matrix,
++                          # fraction of large Gaussians per interval, "G3 only by scale weight", ...
++        points: [         # strided subsample (max_points) of the valid Gaussians
++            {
++                similarity,      # S_k used for the selection (with scale weight)
++                similarity_raw,  # same views without the scale weight (same [0, 1] clamp)
++                radius,          # mean projected radius over the valid views (px, rasterizer 3-sigma radius)
++                scale_weight,    # mean scale weight over the same views
++                interval,        # 0: >= mean - std, 1..3: G1..G3 from the weighted score
++                interval_raw,    # the same from the unweighted score
++                scale_ratio,     # min / max world scale (kept for the previous plot)
++                grad,            # mean positional gradient of the interval
++            }, ...
++        ]
+     }
++    Requires the training loop to pass radius / scale_weight / raw_score to accumulate_similarity.
+     """
+ 
+-    similarity = gaussians.get_similarity_score.detach().squeeze(1)
+-    valid_mask = gaussians.sim_view_count.detach().squeeze(1) > 0
+-
+-    scaling = gaussians.get_scaling.detach()
+-
+-    max_scale = scaling.max(dim=1).values
+-    min_scale = scaling.min(dim=1).values
+-
+-    scale_ratio = min_scale / (max_scale + 1e-12)
+-
+-    similarity = similarity[valid_mask]
+-    scale_ratio = scale_ratio[valid_mask]
+-
+-    points = []
++    summary, pts = scale_weight_analysis(gaussians, radius_ref=radius_ref, max_points=max_points)
++    if pts is None:
++        print(f"[ITER {iteration}] similarity-scale statistics skipped: {format_summary(summary)}")
++        return
+ 
+-    for sim, ratio in zip(similarity.cpu().tolist(), scale_ratio.cpu().tolist()):
+-        points.append({
+-            "similarity": sim,
+-            "scale_ratio": ratio
+-        })
++    keys = list(pts.keys())
++    columns = [pts[k].tolist() for k in keys]
++    points = [dict(zip(keys, values)) for values in zip(*columns)]
+ 
+     stats_entry = {
+         "iteration": int(iteration),
++        "summary": summary,
+         "points": points
+     }
+ 
+@@ -1456,10 +1465,11 @@ def save_similarity_scale_statistics_json(
+ 
+     data.sort(key=lambda x: x["iteration"])
+ 
++    # compact JSON: with indent=2 a file with 1e5 points per iteration grows several times larger
+     with open(json_path, "w") as f:
+-        json.dump(data, f, indent=2)
++        json.dump(data, f)
+ 
+-    print(f"[ITER {iteration}] Saved similarity-scale statistics.")
++    print(f"[ITER {iteration}] Saved similarity-scale statistics: {format_summary(summary)}")
+ 
+ def save_similarity_statistics_json(
+     scene,
+diff --git a/utils/scale_weight_stats.py b/utils/scale_weight_stats.py
+new file mode 100644
+index 0000000..139b026
+--- /dev/null
++++ b/utils/scale_weight_stats.py
+@@ -0,0 +1,130 @@
++#
++# Scale-weight diagnostics (review item 4).
++#
++# Call at a densification step after GaussianModel.finalize_similarity_score() and before
++# densification. It compares the score used for selection (with the scale weight) with the
++# counterfactual score from the same views without the scale weight, and relates both to the
++# projected radius that the scale weight acts on.
++#
++#   radius        : mean projected radius over the valid views of the interval (px). This is the
++#                   rasterizer radius ceil(3 * sqrt(lambda_max)) of the projected 2D covariance,
++#                   i.e. the quantity normalized by R_min / R_max in the scale weight.
++#   scale_weight  : mean of 1 - lambda_s * clip((R - R_min) / (R_max - R_min), 0, 1) over the same views
++#   similarity_raw: mean of clip(view score, 0, 1) over the same views (no scale weight)
++#   interval      : 0 = valid but >= mean - std, 1..3 = G1..G3 (same definition as the selection),
++#                   computed separately for the weighted and the unweighted score
++#
++# Requires the training loop to pass radius / scale_weight / raw_score to accumulate_similarity.
++# No global RNG is used (subsampling is strided).
++#
++
++import torch
++
++from utils.sem_select import stratified_plan, strided_subsample, spearman, summarize
++
++INTERVALS = ["none", "G1", "G2", "G3"]
++
++
++def interval_labels(score, valid):
++    """-1 for invalid, 0 for valid but >= mean - std, 1..3 for G1..G3."""
++    plan = stratified_plan(score, valid, 1.0)  # the sampling ratio is irrelevant for the masks
++    labels = torch.zeros_like(score, dtype=torch.long)
++    labels[~valid] = -1
++    if plan["masks"] is not None:
++        for i, m in enumerate(plan["masks"], start=1):
++            labels[m] = i
++    return labels, plan
++
++
++@torch.no_grad()
++def scale_weight_analysis(gaussians, radius_ref=20.0, max_points=100_000):
++    """
++    Returns (summary dict, points dict of numpy arrays for a strided subsample of the valid Gaussians).
++    summary is None-filled if the diagnostic accumulators were not fed by the training loop.
++    """
++    count = gaussians.sim_view_count.squeeze(1)
++    score = gaussians.get_similarity_score.squeeze(1).detach()
++    valid = (count > 0) & (score >= 0)
++    n_valid = int(valid.sum().item())
++
++    diag_ok = gaussians._diag_ready(count.shape[0]) and n_valid > 0 and \
++        bool((gaussians.sim_diag_accum[valid, 1] > 0).any().item())
++    if not diag_ok:
++        print("[scale_weight_analysis] diagnostic accumulators are empty: pass radius / scale_weight / raw_score "
++              "to accumulate_similarity in the training loop")
++        return {"n_valid": n_valid, "diag_available": False}, None
++
++    raw = gaussians.get_unweighted_similarity()
++    radius = gaussians.get_mean_projected_radius()
++    weight = gaussians.get_mean_scale_weight()
++    grads = (gaussians.xyz_gradient_accum / (gaussians.denom + 1e-8)).squeeze(1)
++    grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
++    scaling = gaussians.get_scaling.detach()
++    scale_ratio = scaling.min(dim=1).values / (scaling.max(dim=1).values + 1e-12)
++
++    lab_w, plan_w = interval_labels(score, valid)
++    lab_r, plan_r = interval_labels(raw, valid)
++    large = radius >= radius_ref
++
++    # transition[i][j]: Gaussians in interval i with the scale weight and interval j without it
++    lw = lab_w[valid].clamp_min(0)
++    lr = lab_r[valid].clamp_min(0)
++    transition = torch.bincount(lw * 4 + lr, minlength=16).view(4, 4).tolist()
++
++    per_interval = {}
++    for i, name in enumerate(INTERVALS):
++        m = valid & (lab_w == i)
++        n = int(m.sum().item())
++        per_interval[name] = {
++            "n": n,
++            "frac_large": (large[m].float().mean().item() if n else None),
++            "radius": summarize(radius, m),
++            "scale_weight_mean": (weight[m].mean().item() if n else None),
++            "score_drop_mean": ((raw[m] - score[m]).mean().item() if n else None),
++        }
++
++    def only_by_weight(target):
++        """Fraction of weighted interval >= target whose unweighted interval is below target."""
++        m = valid & (lab_w >= target)
++        n = int(m.sum().item())
++        if n == 0:
++            return None
++        return ((lab_r[m] < target).float().mean().item())
++
++    summary = {
++        "diag_available": True,
++        "n_valid": n_valid,
++        "radius_ref": float(radius_ref),
++        "frac_large_valid": large[valid].float().mean().item(),
++        "weighted": {"mean": plan_w["mean"], "std": plan_w["std"], "counts": plan_w["counts"]},
++        "unweighted": {"mean": plan_r["mean"], "std": plan_r["std"], "counts": plan_r["counts"]},
++        "per_interval_weighted": per_interval,
++        "transition_weighted_x_unweighted": transition,   # rows/cols: none, G1, G2, G3
++        "g3_only_by_scale_weight": only_by_weight(3),     # in G3 only because of the scale weight
++        "candidates_only_by_scale_weight": only_by_weight(1),  # in G1..G3 only because of the scale weight
++        "spearman_weighted_vs_radius": spearman(score[valid], radius[valid]),
++        "spearman_unweighted_vs_radius": spearman(raw[valid], radius[valid]),
++    }
++
++    idx = strided_subsample(torch.nonzero(valid, as_tuple=False).squeeze(1), int(max_points))
++    points = {
++        "similarity": score[idx].float().cpu().numpy(),
++        "similarity_raw": raw[idx].float().cpu().numpy(),
++        "radius": radius[idx].float().cpu().numpy(),
++        "scale_weight": weight[idx].float().cpu().numpy(),
++        "interval": lab_w[idx].cpu().numpy(),
++        "interval_raw": lab_r[idx].cpu().numpy(),
++        "scale_ratio": scale_ratio[idx].float().cpu().numpy(),
++        "grad": grads[idx].float().cpu().numpy(),
++    }
++    return summary, points
++
++
++def format_summary(summary):
++    if not summary.get("diag_available"):
++        return "scale-weight diagnostics unavailable"
++    g3 = summary["per_interval_weighted"]["G3"]
++    pct = lambda v: "n/a" if v is None else f"{100 * v:.1f}%"
++    return (f"valid={summary['n_valid']}, large(>= {summary['radius_ref']:g}px)={pct(summary['frac_large_valid'])} | "
++            f"G1/G2/G3 with weight={summary['weighted']['counts']}, without={summary['unweighted']['counts']} | "
++            f"G3 large={pct(g3['frac_large'])}, G3 only by scale weight={pct(summary['g3_only_by_scale_weight'])}")
+diff --git a/utils/sem_logger.py b/utils/sem_logger.py
+index 41a0577..c2d0cee 100644
+--- a/utils/sem_logger.py
++++ b/utils/sem_logger.py
+@@ -63,6 +63,12 @@ class SemLogger:
+             if rho is not None:
+                 self._shadow_corr.append(rho)
+ 
++    def save_arrays(self, prefix, iteration, arrays):
++        """Extra per-Gaussian arrays, e.g. scale-weight diagnostics: sem_snapshots/<prefix>_iter_XXXXX.npz"""
++        if not self.enabled or arrays is None:
++            return
++        np.savez_compressed(os.path.join(self.snapshot_dir, f"{prefix}_iter_{int(iteration):05d}.npz"), **arrays)
++
+     def log_step(self, iteration, stats, extra=None):
+         if not self.enabled:
+             self._reset_interval()
+-- 
+2.43.0
+

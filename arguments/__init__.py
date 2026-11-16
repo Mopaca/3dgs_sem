@@ -113,6 +113,7 @@ class OptimizationParams(ParamGroup):
         self.sem_r9_threshold = 0.1       # r9 mode: error threshold
         self.sem_r9_cap = 0.05            # r9 mode: max fraction of Gaussians added per step
         self.sem_dino_chunk = 0           # >0: upsample DINOv2 features in channel chunks of this size (less VRAM)
+        self.sem_dino_gt_cache = "none"   # GT DINOv2 feature cache: none | cpu | cuda
         self.sem_blur_sigma = 4.0         # l1_blur: Gaussian blur sigma (px)
         self.sem_shadow = "none"          # extra signal back-projected through the 3rd aux channel (logging only)
         self.sem_split = "adc"            # adc (densify_and_split_by_selected_mask) | mask2

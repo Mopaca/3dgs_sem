@@ -8,11 +8,14 @@ class DinoSimilarity:
         self,
         model_name="dinov2_vits14",
         device="cuda",
-        channel_chunk=0
+        channel_chunk=0,
+        gt_cache="none"
     ):
         self.device = device
-        # 0: 기존 방식(전체 채널을 한 번에 upsampling), >0: 채널을 이 크기로 나눠 계산(메모리 절약)
         self.channel_chunk = int(channel_chunk)
+        # GT feature 캐시: none(사용 안 함) | cpu | cuda. 키는 학습 view의 이름이다.
+        self.gt_cache_device = None if gt_cache == "none" else gt_cache
+        self.gt_cache = {}
 
         self.model = torch.hub.load(
             "dinov2/",
@@ -215,7 +218,8 @@ class DinoSimilarity:
         render_bchw,
         gt_bchw,
         dense_feature_upsampling=True,
-        mode="bilinear"
+        mode="bilinear",
+        gt_key=None
     ):
         """
         Args:
@@ -234,7 +238,15 @@ class DinoSimilarity:
             )
 
         feat_r = self.extract_feats(render_bchw)
-        feat_g = self.extract_feats(gt_bchw)
+        if self.gt_cache_device is None or gt_key is None:
+            feat_g = self.extract_feats(gt_bchw)
+        else:
+            cached = self.gt_cache.get(gt_key)
+            if cached is None:
+                feat_g = self.extract_feats(gt_bchw)
+                self.gt_cache[gt_key] = feat_g.to(self.gt_cache_device)
+            else:
+                feat_g = cached.to(self.device, non_blocking=True)
 
         output_size = gt_bchw.shape[-2:]
 

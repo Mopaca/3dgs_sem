@@ -271,7 +271,7 @@ def test_resolve_config():
     print("[6] resolve_sem_config")
     with open(os.path.join(ROOT, "train_sim.py"), encoding="utf-8") as f:
         tree = ast.parse(f.read())
-    keep = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "resolve_sem_config"
+    keep = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("resolve_sem_config", "sem_console_line")
             or isinstance(n, ast.Assign) and any(getattr(t, "id", "").startswith("SEM_") for t in n.targets)]
     ns = {"json": json, "SIGNALS": ("dino", "ssim", "l1", "l1_blur")}
     exec(compile(ast.Module(body=keep, type_ignores=[]), "train_sim_subset", "exec"), ns)
@@ -282,6 +282,14 @@ def test_resolve_config():
     check(cfg["view_norm"] == "mean" and cfg["view_agg"] == "mean", "ours: auto -> mean / mean")
     cfg = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_mode="r9", sem_lambda_scale=0.0)))
     check(cfg["view_norm"] == "sum" and cfg["view_agg"] == "max", "r9: auto -> sum / max")
+    line = ns["sem_console_line"](3000, {"n_total": 1234567, "n_grad": 1200, "n_sem": 300, "n_sem_only": 120,
+                                          "interval_counts": [4000, 300, 40], "interval_samples": [100, 100, 40],
+                                          "radius_sem": {"frac_ge_ref": 0.35}}, {"g3_only_by_scale_weight": 0.8})
+    print("   ", line)
+    check(line.startswith("[sem 3000]") and "G1/G2/G3=4000/300/40" in line and "80%" in line, "console progress line")
+    check("r9 candidates" in ns["sem_console_line"](3000, {"n_total": 10, "n_grad": 1, "n_sem": 2, "n_sem_only": 1,
+                                                           "r9_n_candidates": 5, "r9_cap_bound": True}, None),
+          "console progress line (r9 mode)")
     for bad in [dict(sem_view_norm="sum"), dict(sem_view_agg="max"), dict(sem_signal="vgg"),
                 dict(sem_mode="r9", sem_select="radius_matched")]:
         try:

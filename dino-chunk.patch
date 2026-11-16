@@ -1,0 +1,133 @@
+From c2bf8460848da1182431fd89d610359b3513671a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 15:32:27 +0900
+Subject: [PATCH] Optional channel-chunked DINOv2 feature upsampling
+ (--sem_dino_chunk)
+
+Upsamples the 384-channel patch features in channel chunks and accumulates the dot
+product and squared norms, instead of materializing full-resolution feature maps.
+Default 0 keeps the previous computation unchanged; with chunking the similarity map
+differs only at float32 rounding level (max ~1e-6, summation order).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PHmjveU9kNqt1TKBUX99W4
+---
+ arguments/__init__.py |  1 +
+ train_sim.py          |  2 +-
+ utils/dino_utils.py   | 29 ++++++++++++++++++++++++++---
+ utils/signal_maps.py  |  4 ++--
+ 4 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index f4d7a32..b0b01eb 100644
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -111,6 +111,7 @@ class OptimizationParams(ParamGroup):
+         self.sem_sample_ratio = 0.3       # rho of the stratified sampling
+         self.sem_r9_threshold = 0.1       # r9 mode: error threshold
+         self.sem_r9_cap = 0.05            # r9 mode: max fraction of Gaussians added per step
++        self.sem_dino_chunk = 0           # >0: upsample DINOv2 features in channel chunks of this size (less VRAM)
+         self.sem_blur_sigma = 4.0         # l1_blur: Gaussian blur sigma (px)
+         self.sem_shadow = "none"          # extra signal back-projected through the 3rd aux channel (logging only)
+         self.sem_split = "adc"            # adc (densify_and_split_by_selected_mask) | mask2
+diff --git a/train_sim.py b/train_sim.py
+index e6ebd22..4baa515 100644
+--- a/train_sim.py
++++ b/train_sim.py
+@@ -65,7 +65,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+     scene = Scene(dataset, gaussians)
+     # Created at the same point as the previous DinoSimilarity, so a dino run consumes the RNG identically.
+-    guidance = GuidanceMaps([sem_cfg["signal"], sem_cfg["shadow"]], device="cuda", blur_sigma=opt.sem_blur_sigma) ###
++    guidance = GuidanceMaps([sem_cfg["signal"], sem_cfg["shadow"]], device="cuda", blur_sigma=opt.sem_blur_sigma, dino_chunk=opt.sem_dino_chunk) ###
+     gaussians.training_setup(opt)
+     sem_logger = SemLogger(scene.model_path, enabled=opt.sem_log) ###
+     save_run_config(scene.model_path, dataset, opt, pipe, sem_cfg, run_info) ###
+diff --git a/utils/dino_utils.py b/utils/dino_utils.py
+index 0e571fb..c9a7657 100644
+--- a/utils/dino_utils.py
++++ b/utils/dino_utils.py
+@@ -7,9 +7,12 @@ class DinoSimilarity:
+     def __init__(
+         self,
+         model_name="dinov2_vits14",
+-        device="cuda"
++        device="cuda",
++        channel_chunk=0
+     ):
+         self.device = device
++        # 0: 기존 방식(전체 채널을 한 번에 upsampling), >0: 채널을 이 크기로 나눠 계산(메모리 절약)
++        self.channel_chunk = int(channel_chunk)
+ 
+         self.model = torch.hub.load(
+             "dinov2/",
+@@ -122,7 +125,8 @@ class DinoSimilarity:
+         gt_features,
+         output_size,
+         mode="bilinear",
+-        eps=1e-8
++        eps=1e-8,
++        channel_chunk=0
+     ):
+         """
+         Patch-grid feature를 먼저 원본 해상도로 보간한 뒤
+@@ -153,6 +157,24 @@ class DinoSimilarity:
+         if mode in ("linear", "bilinear", "bicubic", "trilinear"):
+             interpolate_kwargs["align_corners"] = False
+ 
++        if channel_chunk and channel_chunk > 0:
++            # 메모리 절약 경로: 채널을 나눠 upsampling하고 내적과 norm 제곱만 누적한다.
++            # 채널별 보간 결과는 전체 보간과 같고, 채널 합의 순서만 달라 float32 반올림 수준(약 1e-6)의 차이가 난다.
++            batch, channels = render_features.shape[:2]
++            height, width = output_size
++            dot = render_features.new_zeros(batch, 1, height, width)
++            render_sq = render_features.new_zeros(batch, 1, height, width)
++            gt_sq = render_features.new_zeros(batch, 1, height, width)
++            for c0 in range(0, channels, channel_chunk):
++                r = F.interpolate(render_features[:, c0:c0 + channel_chunk], **interpolate_kwargs)
++                g = F.interpolate(gt_features[:, c0:c0 + channel_chunk], **interpolate_kwargs)
++                dot += (r * g).sum(dim=1, keepdim=True)
++                render_sq += (r * r).sum(dim=1, keepdim=True)
++                gt_sq += (g * g).sum(dim=1, keepdim=True)
++                del r, g
++            similarity_map = dot / (render_sq.sqrt().clamp_min(eps) * gt_sq.sqrt().clamp_min(eps))
++            return similarity_map.clamp(-1.0, 1.0)
++
+         render_dense = F.interpolate(
+             render_features,
+             **interpolate_kwargs
+@@ -223,7 +245,8 @@ class DinoSimilarity:
+                 render_features=feat_r,
+                 gt_features=feat_g,
+                 output_size=output_size,
+-                mode=mode
++                mode=mode,
++                channel_chunk=self.channel_chunk
+             )
+         else:
+             # 기존 방식:
+diff --git a/utils/signal_maps.py b/utils/signal_maps.py
+index 1fe7062..dee0af7 100644
+--- a/utils/signal_maps.py
++++ b/utils/signal_maps.py
+@@ -90,7 +90,7 @@ class GuidanceMaps:
+     the same random-number consumption as the previous code.
+     """
+ 
+-    def __init__(self, names, device="cuda", dino_model="dinov2_vits14", blur_sigma=4.0):
++    def __init__(self, names, device="cuda", dino_model="dinov2_vits14", blur_sigma=4.0, dino_chunk=0):
+         self.names = {n for n in names if n and n != "none"}
+         unknown = self.names - set(SIGNALS)
+         if unknown:
+@@ -100,7 +100,7 @@ class GuidanceMaps:
+         self.dino = None
+         if "dino" in self.names:
+             from utils.dino_utils import DinoSimilarity
+-            self.dino = DinoSimilarity(model_name=dino_model, device=device)
++            self.dino = DinoSimilarity(model_name=dino_model, device=device, channel_chunk=dino_chunk)
+ 
+     @torch.no_grad()
+     def goodness(self, name, render_chw, gt_chw):
+-- 
+2.43.0
+

@@ -33,7 +33,7 @@ SCENES="flowers treehill garden truck" SEEDS="0 1 2" RHO=0.3 bash run_decisive.s
 python collect_results.py --root output/decisive
 ```
 
-데이터 경로는 `M360_DIR`, `TANDT_DIR`, `DB_DIR`, 출력 경로는 `OUT_ROOT` 환경변수로 바꾼다. DINOv2를 쓰는 조건은 저장소 최상위에 `dinov2/`가 있어야 한다.
+데이터 경로는 `M360_DIR`, `TANDT_DIR`, `DB_DIR`, 출력 경로는 `OUT_ROOT`, DINOv2 가중치 캐시는 `TORCH_HOME` 환경변수로 바꾼다. 학습 출력은 화면과 `train.log`에 함께 남는다(`SHOW_LOG=1`, 기본값). `SHOW_LOG=2`는 렌더링·지표 계산 출력까지 보여 주고, `SHOW_LOG=0`은 로그 파일에만 쓴다. `--sem_log`가 켜져 있으면 1000 iteration마다 semantic 선택 현황이 한 줄씩 출력되고, 각 run이 끝나면 PSNR·SSIM·LPIPS·#GS·학습 시간이 한 줄로 출력된다. DINOv2를 쓰는 조건은 저장소 최상위에 `dinov2/`가 있어야 한다.
 
 **주의.** `RHO`는 보고된 Ours를 만든 ρ 값으로 맞춰야 한다. 커밋 343c470의 코드에는 0.2, 논문에는 0.3으로 적혀 있다. 임계값 τ_g는 스크립트가 0.0002를 명시적으로 넘기므로 `arguments/__init__.py`의 기본값과 무관하다.
 

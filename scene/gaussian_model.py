@@ -1729,7 +1729,8 @@ class GaussianModel:
         grad_mask = grad_mag >= max_grad
 
         sim_score = self.get_similarity_score.squeeze(1).detach()
-        sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >= 0))
+        # sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >= 0))
+        sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >= 0) & (grad_mag > 0))
 
         select_info = {}
         if cfg["mode"] == "ours":
