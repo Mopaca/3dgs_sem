@@ -25,7 +25,7 @@ import torch
 # Proposed rule
 # ---------------------------------------------------------------------------
 
-def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio):
+def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio, intervals=3):
     """
     Interval masks and per-interval sample sizes of the stratified sampling, without sampling.
 
@@ -34,7 +34,13 @@ def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio):
         counts       : [c1, c2, c3] (int)
         num_samples  : [K1, K2, K3] (int, 0 for empty intervals)
         mean, std    : score statistics over the valid candidates (float or None)
+
+    intervals=3 (default) is the original rule. intervals=2 merges G2 and G3 into one interval
+    (score < mean - 2 std); the third entry of masks / counts / num_samples is then empty (0),
+    so the returned lists keep their length and the logging code is unchanged.
     """
+    if intervals not in (2, 3):
+        raise ValueError(f"intervals must be 2 or 3, got {intervals}")
     plan = {"masks": None, "counts": [0, 0, 0], "num_samples": [0, 0, 0], "mean": None, "std": None}
 
     if not sim_valid_mask.any():
@@ -47,8 +53,12 @@ def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio):
     plan["std"] = sim_std.item()
 
     mask_high = (sim_valid_mask & (sim_score >= sim_mean - 2.0 * sim_std) & (sim_score < sim_mean - 1.0 * sim_std))
-    mask_mid = (sim_valid_mask & (sim_score >= sim_mean - 3.0 * sim_std) & (sim_score < sim_mean - 2.0 * sim_std))
-    mask_low = (sim_valid_mask & (sim_score < sim_mean - 3.0 * sim_std))
+    if intervals == 3:
+        mask_mid = (sim_valid_mask & (sim_score >= sim_mean - 3.0 * sim_std) & (sim_score < sim_mean - 2.0 * sim_std))
+        mask_low = (sim_valid_mask & (sim_score < sim_mean - 3.0 * sim_std))
+    else:
+        mask_mid = (sim_valid_mask & (sim_score < sim_mean - 2.0 * sim_std))   # G2 and G3 merged
+        mask_low = torch.zeros_like(sim_valid_mask)
     masks = [mask_high, mask_mid, mask_low]
     plan["masks"] = masks
 
@@ -84,8 +94,8 @@ def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio):
     return plan
 
 
-def select_stratified(sim_score, sim_valid_mask, global_sample_ratio):
-    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio)
+def select_stratified(sim_score, sim_valid_mask, global_sample_ratio, intervals=3):
+    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio, intervals)
     mask_out = torch.zeros_like(sim_score, dtype=torch.bool)
     if plan["masks"] is None:
         return mask_out, plan
@@ -105,8 +115,8 @@ def select_stratified(sim_score, sim_valid_mask, global_sample_ratio):
 # Controls (same count as the stratified plan)
 # ---------------------------------------------------------------------------
 
-def select_random_matched(sim_score, sim_valid_mask, global_sample_ratio):
-    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio)
+def select_random_matched(sim_score, sim_valid_mask, global_sample_ratio, intervals=3):
+    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio, intervals)
     mask_out = torch.zeros_like(sim_score, dtype=torch.bool)
     k_total = int(sum(plan["num_samples"]))
     if k_total == 0:
@@ -118,9 +128,9 @@ def select_random_matched(sim_score, sim_valid_mask, global_sample_ratio):
     return mask_out, plan
 
 
-def select_radius_matched(sim_score, sim_valid_mask, global_sample_ratio, radius):
+def select_radius_matched(sim_score, sim_valid_mask, global_sample_ratio, radius, intervals=3):
     """`radius`: [N] projected radius per Gaussian (mean over the valid views of the interval)."""
-    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio)
+    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio, intervals)
     mask_out = torch.zeros_like(sim_score, dtype=torch.bool)
     k_total = int(sum(plan["num_samples"]))
     if k_total == 0:

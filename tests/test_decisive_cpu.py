@@ -187,7 +187,8 @@ def test_full_step_equivalence():
 
     # other modes run and keep the bookkeeping consistent
     for cfg in [{"select": "random_matched"}, {"select": "radius_matched"},
-                {"mode": "r9", "r9_threshold": 0.05}, {"split": "mask2"}]:
+                {"mode": "r9", "r9_threshold": 0.05}, {"split": "mask2"},
+                {"valid_grad": True, "min_views": 2}, {"intervals": 2}, {"intervals": 2, "select": "radius_matched"}]:
         m = make_model(new_mod)
         inp = random_step_inputs(m.get_xyz.shape[0], seed=7)
         apply_inputs(m, inp)
@@ -248,6 +249,14 @@ def test_controls_and_r9():
     check(info["cap_bound"] and int(m9.sum()) == int(0.05 * 20000), f"cap binds at 5% ({info})")
     m9b, info_b = sem_select.select_threshold_cap(err, valid, 0.99, 0.05)
     check(not info_b["cap_bound"] and int(m9b.sum()) == info_b["n_candidates"], f"below cap keeps all candidates ({info_b})")
+    # 2 intervals: G1 unchanged, G2 and G3 merged, third interval empty
+    p2 = sem_select.stratified_plan(score, valid, 0.3, intervals=2)
+    check(p2["counts"][0] == plan["counts"][0] and p2["counts"][1] == plan["counts"][1] + plan["counts"][2]
+          and p2["counts"][2] == 0 and p2["num_samples"][2] == 0, f"2 intervals: counts={p2['counts']}, K={p2['num_samples']}")
+    p3 = sem_select.stratified_plan(score, valid, 0.3, intervals=3)
+    check(p3["counts"] == plan["counts"] and p3["num_samples"] == plan["num_samples"], "intervals=3 equals the default plan")
+    torch.manual_seed(0); m2, _ = sem_select.select_stratified(score, valid, 0.3, intervals=2)
+    check(int(m2.sum()) == sum(p2["num_samples"]) and bool((m2 & ~valid).sum() == 0), "2 intervals: selects sum(K), valid only")
     rho = sem_select.spearman(score, score * 2 + 1)
     check(rho is not None and abs(rho - 1.0) < 1e-6, "spearman of a monotone transform = 1")
 
@@ -277,11 +286,16 @@ def test_resolve_config():
     exec(compile(ast.Module(body=keep, type_ignores=[]), "train_sim_subset", "exec"), ns)
     base = dict(sem_mode="ours", sem_signal="dino", sem_shadow="none", sem_select="stratified", sem_split="adc",
                 sem_view_norm="auto", sem_view_agg="auto", sem_sample_ratio=0.3, sem_r9_threshold=0.1, sem_r9_cap=0.05,
-                sem_radius_max=20.0, sem_lambda_scale=0.3, sem_log=False)
+                sem_radius_max=20.0, sem_lambda_scale=0.3, sem_log=False, sem_scale_mode="linear",
+                sem_valid_grad=False, sem_min_views=1, sem_intervals=3)
     cfg = ns["resolve_sem_config"](SimpleNamespace(**base))
     check(cfg["view_norm"] == "mean" and cfg["view_agg"] == "mean", "ours: auto -> mean / mean")
     cfg = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_mode="r9", sem_lambda_scale=0.0)))
     check(cfg["view_norm"] == "sum" and cfg["view_agg"] == "max", "r9: auto -> sum / max")
+    d = ns["resolve_sem_config"](SimpleNamespace(**base))["densify"]
+    check(d["valid_grad"] is False and d["min_views"] == 1 and d["intervals"] == 3, "defaults: valid_grad off, min_views 1, 3 intervals")
+    d = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_valid_grad=True, sem_min_views=2, sem_intervals=2)))["densify"]
+    check(d["valid_grad"] is True and d["min_views"] == 2 and d["intervals"] == 2, "valid_grad / min_views / intervals are passed to the densify config")
     line = ns["sem_console_line"](3000, {"n_total": 1234567, "n_grad": 1200, "n_sem": 300, "n_sem_only": 120,
                                           "interval_counts": [4000, 300, 40], "interval_samples": [100, 100, 40],
                                           "radius_sem": {"frac_ge_ref": 0.35}}, {"g3_only_by_scale_weight": 0.8})

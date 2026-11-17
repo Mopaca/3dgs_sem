@@ -352,6 +352,10 @@ def resolve_sem_config(opt):
     view_agg = opt.sem_view_agg if opt.sem_view_agg != "auto" else ("mean" if mode == "ours" else "max")
     if view_norm not in ("mean", "sum"):
         raise ValueError(f"--sem_view_norm must be auto|mean|sum, got '{opt.sem_view_norm}'")
+    if opt.sem_intervals not in (2, 3):
+        raise ValueError(f"--sem_intervals must be 2 or 3, got {opt.sem_intervals}")
+    if opt.sem_min_views < 1:
+        raise ValueError(f"--sem_min_views must be >= 1, got {opt.sem_min_views}")
     if opt.sem_scale_mode not in ("linear", "power"):
         raise ValueError(f"--sem_scale_mode must be linear|power, got '{opt.sem_scale_mode}'")
 
@@ -377,6 +381,9 @@ def resolve_sem_config(opt):
         "r9_cap": opt.sem_r9_cap,
         "split": opt.sem_split,
         "radius_ref": opt.sem_radius_max,
+        "valid_grad": bool(opt.sem_valid_grad),
+        "min_views": int(opt.sem_min_views),
+        "intervals": int(opt.sem_intervals),
         "collect_stats": bool(opt.sem_log),
     }
     cfg = {"mode": mode, "signal": opt.sem_signal, "shadow": opt.sem_shadow,

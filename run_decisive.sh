@@ -35,14 +35,25 @@ TAU_G=${TAU_G:-0.0002}   # positional-gradient threshold (3DGS default)
 RHO=${RHO:-0.3}          # stratified sampling ratio: SET TO THE VALUE USED FOR THE REPORTED "Ours"
 SPLIT=${SPLIT:-adc}      # densify_and_split_by_selected_mask (used for the reported "Ours")
 
+# ---------------- candidate set / interval options (applied to every arm) ----------------
+VALID_GRAD=${VALID_GRAD:-1}   # 1: exclude Gaussians with zero accumulated positional gradient (--sem_valid_grad)
+MIN_VIEWS=${MIN_VIEWS:-1}     # minimum number of valid views per densification interval (--sem_min_views)
+INTERVALS=${INTERVALS:-3}     # 3: G1/G2/G3 | 2: G2 and G3 merged (--sem_intervals)
+DINO_CHUNK=${DINO_CHUNK:-64}  # channel chunk of the DINOv2 feature upsampling (0: original path)
+GT_CACHE=${GT_CACHE:-cpu}     # GT DINOv2 feature cache: none | cpu | cuda
+OUTDOOR_IMG=${OUTDOOR_IMG:-images_4}   # Mip-NeRF 360 outdoor image folder (images_8 for a small local GPU)
+INDOOR_IMG=${INDOOR_IMG:-images_2}     # Mip-NeRF 360 indoor image folder
+
 # ---------------- what to run ----------------
 SCENES=${SCENES:-"flowers treehill garden truck"}
 SEEDS=${SEEDS:-"0"}
 ARMS=${ARMS:-"dino_l03 ssim_l03 l1_l03 dino_l0 ssim_l0 l1_l0 rand_matched radius_matched"}
 
-ITER=30000
-COMMON="--eval --disable_viewer --test_iterations -1 --save_iterations $ITER \
---densify_grad_threshold $TAU_G --sem_sample_ratio $RHO --sem_split $SPLIT --sem_log"
+ITER=${ITER:-30000}      # ITER=15000 stops right after the densification phase (half the time)
+COMMON="--eval --disable_viewer --test_iterations -1 --iterations $ITER --save_iterations $ITER \
+--densify_grad_threshold $TAU_G --sem_sample_ratio $RHO --sem_split $SPLIT --sem_log \
+--sem_dino_chunk $DINO_CHUNK --sem_dino_gt_cache $GT_CACHE --sem_min_views $MIN_VIEWS --sem_intervals $INTERVALS"
+if [ "$VALID_GRAD" = 1 ]; then COMMON="$COMMON --sem_valid_grad"; fi
 
 M360_OUTDOOR="bicycle flowers garden stump treehill"
 M360_INDOOR="room counter kitchen bonsai"
@@ -53,8 +64,8 @@ contains() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
 
 scene_source() {   # prints "<source_path> <image_folder>"
     local s=$1
-    if contains "$M360_OUTDOOR" "$s"; then echo "$M360_DIR/$s images_8"
-    elif contains "$M360_INDOOR" "$s"; then echo "$M360_DIR/$s images_2"
+    if contains "$M360_OUTDOOR" "$s"; then echo "$M360_DIR/$s $OUTDOOR_IMG"
+    elif contains "$M360_INDOOR" "$s"; then echo "$M360_DIR/$s $INDOOR_IMG"
     elif contains "$TANDT_SCENES" "$s"; then echo "$TANDT_DIR/$s images"
     elif contains "$DB_SCENES" "$s"; then echo "$DB_DIR/$s images"
     else return 1; fi

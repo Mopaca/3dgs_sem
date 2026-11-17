@@ -36,6 +36,9 @@ DEFAULT_SEM_CFG = {
     "r9_cap": 0.05,
     "split": "adc",            # adc | mask2
     "radius_ref": 20.0,        # R_max, used for the "fraction >= R_max" statistic
+    "valid_grad": False,       # True: accumulated positional gradient must be > 0 to be a candidate
+    "min_views": 1,            # minimum number of valid views in the densification interval
+    "intervals": 3,            # 3: G1/G2/G3 | 2: G2 and G3 merged
     "collect_stats": False,
     "want_snapshot": False,
     "snapshot_max_points": 200_000,
@@ -1729,18 +1732,24 @@ class GaussianModel:
         grad_mask = grad_mag >= max_grad
 
         sim_score = self.get_similarity_score.squeeze(1).detach()
-        # sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >= 0))
-        sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >= 0) & (grad_mag > 0))
+        # Candidate (valid) set. min_views=1 and valid_grad=False give the original condition
+        # (view count > 0, score >= 0); the view count is integer valued, so ">= 1" equals "> 0".
+        min_views = max(1, int(cfg["min_views"]))
+        sim_valid_mask = ((self.sim_view_count.squeeze(1) >= min_views) & (sim_score >= 0))
+        if cfg["valid_grad"]:
+            # A Gaussian with zero accumulated positional gradient does not affect the loss.
+            sim_valid_mask = sim_valid_mask & (grad_mag > 0)
+        intervals = int(cfg["intervals"])
 
         select_info = {}
         if cfg["mode"] == "ours":
             if cfg["select"] == "stratified":
-                semantic_densify_mask, plan = select_stratified(sim_score, sim_valid_mask, cfg["sample_ratio"])
+                semantic_densify_mask, plan = select_stratified(sim_score, sim_valid_mask, cfg["sample_ratio"], intervals)
             elif cfg["select"] == "random_matched":
-                semantic_densify_mask, plan = select_random_matched(sim_score, sim_valid_mask, cfg["sample_ratio"])
+                semantic_densify_mask, plan = select_random_matched(sim_score, sim_valid_mask, cfg["sample_ratio"], intervals)
             elif cfg["select"] == "radius_matched":
                 semantic_densify_mask, plan = select_radius_matched(sim_score, sim_valid_mask, cfg["sample_ratio"],
-                                                                    self.get_mean_projected_radius())
+                                                                    self.get_mean_projected_radius(), intervals)
             else:
                 raise ValueError(f"Unknown semantic selection: {cfg['select']}")
             select_info = {"score_mean": plan["mean"], "score_std": plan["std"],
