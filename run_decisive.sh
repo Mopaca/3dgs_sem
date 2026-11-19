@@ -39,7 +39,8 @@ SPLIT=${SPLIT:-adc}      # densify_and_split_by_selected_mask (used for the repo
 VALID_GRAD=${VALID_GRAD:-1}   # 1: exclude Gaussians with zero accumulated positional gradient (--sem_valid_grad)
 MIN_VIEWS=${MIN_VIEWS:-1}     # minimum number of valid views per densification interval (--sem_min_views)
 INTERVALS=${INTERVALS:-3}     # 3: G1/G2/G3 | 2: G2 and G3 merged (--sem_intervals)
-MIN_CONTRIB_PX=${MIN_CONTRIB_PX:-0}   # >0: per-view visibility bound, contribution sum / (pi r^2) (--sem_min_contrib_px)
+MIN_CONTRIB_PX=${MIN_CONTRIB_PX:-0}   # >0: per-view visibility bound, contribution sum / footprint area (--sem_min_contrib_px)
+CONTRIB_AREA=${CONTRIB_AREA:-ellipse} # footprint area: ellipse (projected 3-sigma ellipse) | disc (pi r^2)
 DINO_CHUNK=${DINO_CHUNK:-64}  # channel chunk of the DINOv2 feature upsampling (0: original path)
 GT_CACHE=${GT_CACHE:-cpu}     # GT DINOv2 feature cache: none | cpu | cuda
 OUTDOOR_IMG=${OUTDOOR_IMG:-images_4}   # Mip-NeRF 360 outdoor image folder (images_8 for a small local GPU)
@@ -54,7 +55,7 @@ ITER=${ITER:-30000}      # ITER=15000 stops right after the densification phase 
 COMMON="--eval --disable_viewer --test_iterations -1 --iterations $ITER --save_iterations $ITER \
 --densify_grad_threshold $TAU_G --sem_sample_ratio $RHO --sem_split $SPLIT --sem_log \
 --sem_dino_chunk $DINO_CHUNK --sem_dino_gt_cache $GT_CACHE --sem_min_views $MIN_VIEWS --sem_intervals $INTERVALS \
---sem_min_contrib_px $MIN_CONTRIB_PX"
+--sem_min_contrib_px $MIN_CONTRIB_PX --sem_contrib_area $CONTRIB_AREA"
 if [ "$VALID_GRAD" = 1 ]; then COMMON="$COMMON --sem_valid_grad"; fi
 
 M360_OUTDOOR="bicycle flowers garden stump treehill"

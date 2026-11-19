@@ -121,7 +121,8 @@ def random_step_inputs(n, seed):
         "sim_view_count": count,
         "sim_diag_accum": torch.cat([torch.rand((n, 1), generator=g) * 40, torch.rand((n, 1), generator=g) * 0.3 + 0.7,
                                      score, torch.rand((n, 1), generator=g) * 50,
-                                     torch.rand((n, 1), generator=g) * 0.2], dim=1) * count,
+                                     torch.rand((n, 1), generator=g) * 0.2,
+                                     torch.rand((n, 1), generator=g) * 0.3], dim=1) * count,
         "max_radii2D": torch.rand((n,), generator=g) * 40,
         "radii": (torch.rand((n,), generator=g) * 40).int(),
     }
@@ -213,7 +214,8 @@ def test_accumulate():
     g = torch.Generator().manual_seed(0)
     views = [(torch.rand((n, 1), generator=g), (torch.rand((n, 1), generator=g) > 0.3).float()) for _ in range(7)]
     for s, v in views:
-        m.accumulate_similarity(s, v, agg="mean", radius=torch.ones((n, 1)) * 3, contrib=torch.ones((n, 1)) * 2)
+        m.accumulate_similarity(s, v, agg="mean", radius=torch.ones((n, 1)) * 3, contrib=torch.ones((n, 1)) * 2,
+                                ellipse_area=torch.ones((n, 1)) * 8)
         ref_acc += s * v; ref_cnt += v
     check(torch.equal(m.sim_score_accum, ref_acc) and torch.equal(m.sim_view_count, ref_cnt), "mean == previous implementation")
     check(torch.allclose(m.get_mean_projected_radius()[ref_cnt.squeeze(1) > 0], torch.tensor(3.0)), "mean projected radius")
@@ -221,6 +223,44 @@ def test_accumulate():
     check(torch.allclose(m.get_mean_contribution()[seen], torch.tensor(2.0))
           and torch.allclose(m.get_mean_contribution_per_pixel()[seen], torch.tensor(2.0 / (math.pi * 9.0))),
           "mean contribution sum and contribution per footprint pixel")
+    check(torch.allclose(m.get_mean_contribution_per_ellipse_pixel()[seen], torch.tensor(0.25)), "contribution per ellipse pixel")
+
+    # projected ellipse area: same 2D covariance as the rasterizer formula J W Sigma W^T J^T (+0.3)
+    from utils import projected_area
+    g = torch.Generator().manual_seed(1)
+    k = 200
+    xyz = torch.rand((k, 3), generator=g, dtype=torch.float64) * 2 - 1
+    xyz[:, 2] += 4.0
+    scal = torch.rand((k, 3), generator=g, dtype=torch.float64) * 0.05 + 0.002
+    quat = torch.nn.functional.normalize(torch.randn((k, 4), generator=g, dtype=torch.float64), dim=1)
+    ang = 0.3
+    Rc = torch.tensor([[math.cos(ang), 0, math.sin(ang)], [0, 1, 0], [-math.sin(ang), 0, math.cos(ang)]], dtype=torch.float64)
+    tc = torch.tensor([0.1, -0.2, 0.5], dtype=torch.float64)
+    M = torch.eye(4, dtype=torch.float64); M[:3, :3] = Rc.t(); M[3, :3] = tc      # row-vector convention
+    cam = SimpleNamespace(FoVx=1.0, FoVy=0.7, image_width=1200, image_height=800, world_view_transform=M)
+    area, rad = projected_area.projected_ellipse_area(xyz, scal, quat, cam)
+    tfx, tfy = math.tan(0.5), math.tan(0.35)
+    fx, fy = 1200 / (2 * tfx), 800 / (2 * tfy)
+    ref_area = torch.zeros(k, dtype=torch.float64); ref_rad = torch.zeros(k, dtype=torch.float64)
+    for i in range(k):
+        t = Rc @ xyz[i] + tc
+        tx = min(1.3 * tfx, max(-1.3 * tfx, (t[0] / t[2]).item())) * t[2]
+        ty = min(1.3 * tfy, max(-1.3 * tfy, (t[1] / t[2]).item())) * t[2]
+        J = torch.tensor([[fx / t[2], 0, -fx * tx / t[2] ** 2], [0, fy / t[2], -fy * ty / t[2] ** 2]], dtype=torch.float64)
+        Rq = projected_area._quat_to_rotmat(quat[i:i + 1])[0]
+        Sig = Rq @ torch.diag(scal[i] ** 2) @ Rq.t()
+        c2 = J @ Rc @ Sig @ Rc.t() @ J.t() + 0.3 * torch.eye(2, dtype=torch.float64)
+        ev = torch.linalg.eigvalsh(c2)
+        ref_area[i] = 9 * math.pi * torch.sqrt(ev[0] * ev[1])
+        mid = 0.5 * (c2[0, 0] + c2[1, 1]); det = torch.linalg.det(c2)
+        ref_rad[i] = torch.ceil(3 * torch.sqrt(mid + torch.sqrt(torch.clamp(mid * mid - det, min=0.1))))
+    check(torch.allclose(area, ref_area, rtol=1e-9) and torch.equal(rad, ref_rad), "projected ellipse area and radius == explicit J W Sigma W^T J^T")
+    iso = projected_area.projected_ellipse_area(torch.tensor([[0.0, 0.0, 5.0]], dtype=torch.float64), torch.full((1, 3), 0.01, dtype=torch.float64),
+                                                torch.tensor([[1.0, 0, 0, 0]], dtype=torch.float64),
+                                                SimpleNamespace(FoVx=1.0, FoVy=0.7, image_width=1200, image_height=800,
+                                                                world_view_transform=torch.eye(4, dtype=torch.float64)))[0]
+    sig_px = 0.01 * fx / 5.0
+    check(abs(iso.item() - 9 * math.pi * math.sqrt((sig_px ** 2 + 0.3) * ((0.01 * fy / 5.0) ** 2 + 0.3))) < 1e-6, "isotropic Gaussian on the optical axis: area = 9 pi sqrt(det)")
     for agg, fn in (("min", torch.minimum), ("max", torch.maximum)):
         m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1))
         for s, v in views:
@@ -293,7 +333,7 @@ def test_resolve_config():
     base = dict(sem_mode="ours", sem_signal="dino", sem_shadow="none", sem_select="stratified", sem_split="adc",
                 sem_view_norm="auto", sem_view_agg="auto", sem_sample_ratio=0.3, sem_r9_threshold=0.1, sem_r9_cap=0.05,
                 sem_radius_max=20.0, sem_lambda_scale=0.3, sem_log=False, sem_scale_mode="linear",
-                sem_valid_grad=False, sem_min_views=1, sem_intervals=3, sem_min_contrib_px=0.0)
+                sem_valid_grad=False, sem_min_views=1, sem_intervals=3, sem_min_contrib_px=0.0, sem_contrib_area="ellipse")
     cfg = ns["resolve_sem_config"](SimpleNamespace(**base))
     check(cfg["view_norm"] == "mean" and cfg["view_agg"] == "mean", "ours: auto -> mean / mean")
     cfg = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_mode="r9", sem_lambda_scale=0.0)))

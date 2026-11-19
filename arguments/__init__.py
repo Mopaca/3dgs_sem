@@ -117,7 +117,8 @@ class OptimizationParams(ParamGroup):
         self.sem_valid_grad = False       # True: Gaussians whose accumulated positional gradient is exactly 0 are not candidates
         self.sem_min_views = 1            # candidates must be observed in at least this many views of the densification interval
         self.sem_intervals = 3            # 3: G1/G2/G3 (proposed) | 2: G1 and (G2+G3 merged, score < mean - 2 std)
-        self.sem_min_contrib_px = 0.0     # >0: a view counts as an observation only if contribution sum / (pi * radius^2) >= this value
+        self.sem_min_contrib_px = 0.0     # >0: a view counts as an observation only if contribution sum / footprint area >= this value
+        self.sem_contrib_area = "ellipse" # footprint area: ellipse (projected 3-sigma ellipse) | disc (pi * radius^2)
         self.sem_blur_sigma = 4.0         # l1_blur: Gaussian blur sigma (px)
         self.sem_shadow = "none"          # extra signal back-projected through the 3rd aux channel (logging only)
         self.sem_split = "adc"            # adc (densify_and_split_by_selected_mask) | mask2

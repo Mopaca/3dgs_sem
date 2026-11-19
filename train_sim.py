@@ -25,6 +25,7 @@ from utils.percentile_utils import get_priority_top_percent, get_dynamic_priorit
 from utils.signal_maps import GuidanceMaps, SIGNALS ###
 from utils.sem_logger import SemLogger ###
 from utils.scale_weight_stats import scale_weight_analysis ###
+from utils.projected_area import projected_ellipse_area ###
 import json ###
 import math ###
 import time ###
@@ -69,6 +70,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     guidance = GuidanceMaps([sem_cfg["signal"], sem_cfg["shadow"]], device="cuda", blur_sigma=opt.sem_blur_sigma, dino_chunk=opt.sem_dino_chunk, dino_gt_cache=opt.sem_dino_gt_cache) ###
     gaussians.training_setup(opt)
     sem_logger = SemLogger(scene.model_path, enabled=opt.sem_log) ###
+    ellipse_checked = False ###
     save_run_config(scene.model_path, dataset, opt, pipe, sem_cfg, run_info) ###
     priority_cutoff = None
     if checkpoint:
@@ -211,10 +213,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 view_visible_mask = view_visible_mask.unsqueeze(1)
 
             visible_mask = view_visible_mask * (den_grad > 1e-6)
+
+            # Footprint of each Gaussian in this view (px^2). The ellipse area needs the 2D covariance,
+            # which the rasterizer does not return, so it is recomputed for the visible Gaussians.
+            radius_px = radii.detach().float().unsqueeze(1)
+            disc_area = math.pi * radius_px.clamp_min(1.0) ** 2
+            ellipse_area = None
+            need_ellipse = sem_logger.enabled or (sem_cfg["min_contrib_px"] > 0 and sem_cfg["contrib_area"] == "ellipse")
+            if need_ellipse:
+                vis_idx = torch.nonzero(visibility_filter, as_tuple=False).squeeze(1)
+                area_vis, radius_vis = projected_ellipse_area(gaussians.get_xyz.detach()[vis_idx],
+                                                              gaussians.get_scaling.detach()[vis_idx],
+                                                              gaussians.get_rotation.detach()[vis_idx], viewpoint_cam)
+                ellipse_area = disc_area.clone()
+                ellipse_area[vis_idx, 0] = area_vis
+                if not ellipse_checked:
+                    # one-time check against the rasterizer: the long-axis radius must agree
+                    ellipse_checked = True
+                    diff = (radius_vis - radius_px[vis_idx, 0]).abs()
+                    print(f"[sem] ellipse footprint check: radius equal for {(diff < 0.5).float().mean().item() * 100:.2f}% "
+                          f"of {vis_idx.numel()} visible Gaussians, max |diff| = {diff.max().item():.1f} px")
+
             if sem_cfg["min_contrib_px"] > 0:
                 # Count the view as an observation only if the Gaussian is visible enough in it:
-                # mean alpha * T over its footprint (disc of the projected 3-sigma radius).
-                footprint = math.pi * radii.detach().float().unsqueeze(1).clamp_min(1.0) ** 2
+                # mean alpha * T over its footprint.
+                footprint = ellipse_area if sem_cfg["contrib_area"] == "ellipse" else disc_area
                 visible_mask = visible_mask * ((den_grad / footprint) >= sem_cfg["min_contrib_px"])
             # visible_mask = visible_mask * wma_weight
 
@@ -222,7 +245,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                             radius=radii.detach().float().unsqueeze(1),
                                             scale_weight=scale_weight,
                                             raw_score=(view_score.clamp(0.0, 1.0) if sem_cfg["mode"] == "ours" else None),
-                                            contrib=den_grad)
+                                            contrib=den_grad, ellipse_area=ellipse_area)
 
             if sem_logger.enabled:
                 shadow_view_score = None
@@ -363,6 +386,8 @@ def resolve_sem_config(opt):
         raise ValueError(f"--sem_intervals must be 2 or 3, got {opt.sem_intervals}")
     if opt.sem_min_views < 1:
         raise ValueError(f"--sem_min_views must be >= 1, got {opt.sem_min_views}")
+    if opt.sem_contrib_area not in ("ellipse", "disc"):
+        raise ValueError(f"--sem_contrib_area must be ellipse|disc, got '{opt.sem_contrib_area}'")
     if opt.sem_min_contrib_px < 0:
         raise ValueError(f"--sem_min_contrib_px must be >= 0, got {opt.sem_min_contrib_px}")
     if opt.sem_scale_mode not in ("linear", "power"):
@@ -397,7 +422,8 @@ def resolve_sem_config(opt):
     }
     cfg = {"mode": mode, "signal": opt.sem_signal, "shadow": opt.sem_shadow,
            "view_norm": view_norm, "view_agg": view_agg, "scale_mode": opt.sem_scale_mode,
-           "min_contrib_px": float(opt.sem_min_contrib_px), "densify": densify_cfg}
+           "min_contrib_px": float(opt.sem_min_contrib_px), "contrib_area": opt.sem_contrib_area,
+           "densify": densify_cfg}
     print(f"[sem] config: {json.dumps(cfg)}")
     return cfg
 

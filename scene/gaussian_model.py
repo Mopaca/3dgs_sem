@@ -30,8 +30,9 @@ from utils.sem_select import (select_stratified, select_random_matched, select_r
 # Default semantic densification config used when densify_and_prune_by_similarity is called
 # without sem_cfg (e.g. train_sim_rendersim.py). It reproduces the behaviour of commit 343c470.
 # columns of sim_diag_accum: projected radius, scale weight, unweighted score,
-# contribution sum, contribution per footprint pixel (diagnostics only, never used for selection)
-DIAG_COLS = 5
+# contribution sum, contribution / disc area, contribution / ellipse area
+# (diagnostics only, never used for selection)
+DIAG_COLS = 6
 
 DEFAULT_SEM_CFG = {
     "mode": "ours",            # ours | r9
@@ -424,7 +425,7 @@ class GaussianModel:
                 and self.sim_diag_accum.shape[1] == DIAG_COLS)
 
     def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None, scale_weight=None, raw_score=None,
-                              contrib=None):
+                              contrib=None, ellipse_area=None):
         """
         view_score:   [N, 1] weighted view score of the current view
         visible_mask: [N, 1] float, 1 for valid views (visible and contribution sum > tau_v)
@@ -435,6 +436,7 @@ class GaussianModel:
         raw_score:    [N, 1] view score before the scale weight, clamped to [0, 1] (optional, diagnostics)
         contrib:      [N, 1] contribution sum of the current view, sum over pixels of alpha * T
                       (the denominator of the weighted mean; optional, diagnostics)
+        ellipse_area: [N, 1] area of the projected 3-sigma ellipse in the current view (optional, diagnostics)
         """
         if agg == "mean":
             self.sim_score_accum += view_score * visible_mask
@@ -456,6 +458,8 @@ class GaussianModel:
                     # mean alpha * T over the footprint, approximated by a disc of the projected (3 sigma) radius
                     area = math.pi * radius.clamp_min(1.0) ** 2
                     self.sim_diag_accum[:, 4:5] += (contrib / area) * visible_mask
+                if ellipse_area is not None:
+                    self.sim_diag_accum[:, 5:6] += (contrib / ellipse_area.clamp_min(1e-6)) * visible_mask
         # self.sim_score_accum += view_score
 
     def finalize_similarity_score(self, eps=1e-8, agg="mean"):
@@ -488,6 +492,10 @@ class GaussianModel:
     def get_mean_contribution_per_pixel(self):
         """[N] mean of contribution sum / (pi * radius^2) over the valid views, 0 if unseen."""
         return self._diag_mean(4)
+
+    def get_mean_contribution_per_ellipse_pixel(self):
+        """[N] mean of contribution sum / area of the projected 3-sigma ellipse over the valid views."""
+        return self._diag_mean(5)
 
     def _diag_mean(self, col):
         count = self.sim_view_count.squeeze(1)
@@ -1839,6 +1847,7 @@ class GaussianModel:
         radius_mean = self.get_mean_projected_radius()
         contrib_mean = self.get_mean_contribution()
         contrib_px = self.get_mean_contribution_per_pixel()
+        contrib_px_ellipse = self.get_mean_contribution_per_ellipse_pixel()
         opacity = self.get_opacity.squeeze(1)
 
         n_sem = int(sem.sum().item())
@@ -1868,6 +1877,8 @@ class GaussianModel:
             "contrib_sem": summarize(contrib_mean, sem),
             "contrib_px_valid": summarize(contrib_px, sim_valid_mask),
             "contrib_px_sem": summarize(contrib_px, sem),
+            "contrib_px_ellipse_valid": summarize(contrib_px_ellipse, sim_valid_mask),
+            "contrib_px_ellipse_sem": summarize(contrib_px_ellipse, sem),
             "opacity_valid": summarize(opacity, sim_valid_mask),
             "opacity_sem": summarize(opacity, sem),
         }
@@ -1886,6 +1897,7 @@ class GaussianModel:
                 "opacity": opacity[idx].float().cpu().numpy(),
                 "contrib_mean": contrib_mean[idx].float().cpu().numpy(),
                 "contrib_per_px": contrib_px[idx].float().cpu().numpy(),
+                "contrib_per_px_ellipse": contrib_px_ellipse[idx].float().cpu().numpy(),
                 "scale_max": torch.max(self.get_scaling, dim=1).values[idx].float().cpu().numpy(),
                 "scale_min": torch.min(self.get_scaling, dim=1).values[idx].float().cpu().numpy(),
                 "tau_g": float(max_grad),
