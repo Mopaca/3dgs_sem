@@ -51,7 +51,7 @@ python collect_results.py --root output/decisive
 
 `--sem_signal dino|ssim|l1|l1_blur`, `--sem_mode ours|r9`, `--sem_select stratified|random_matched|radius_matched`, `--sem_view_norm auto|mean|sum`, `--sem_view_agg auto|mean|min|max`, `--sem_lambda_scale`, `--sem_radius_min`, `--sem_radius_max`, `--sem_sample_ratio`, `--sem_r9_threshold`, `--sem_r9_cap`, `--sem_blur_sigma`, `--sem_shadow`, `--sem_split adc|mask2`, `--sem_log`, 그리고 `train_sim.py`의 `--seed` (0이면 기존과 같은 고정 seed).
 
-후보 집합과 구간 옵션: `--sem_valid_grad`(누적 위치 gradient가 정확히 0인 가우시안을 후보에서 제외), `--sem_min_views N`(densification 간격 안에서 N개 이상의 view에서 유효하게 관측된 가우시안만 후보, 기본 1), `--sem_intervals 3|2`(2이면 G2와 G3를 합쳐 평균 − 2σ 미만을 한 구간으로 둔다). 평균과 표준편차는 이 조건을 통과한 후보 집합에서 계산한다. `run_decisive.sh`에서는 `VALID_GRAD`(기본 1), `MIN_VIEWS`, `INTERVALS`, `DINO_CHUNK`, `GT_CACHE`, `OUTDOOR_IMG`, `INDOOR_IMG`, `ITER` 환경변수로 모든 조건에 공통으로 적용한다.
+후보 집합과 구간 옵션: `--sem_valid_grad`(누적 위치 gradient가 정확히 0인 가우시안을 후보에서 제외), `--sem_min_views N`(densification 간격 안에서 N개 이상의 view에서 유효하게 관측된 가우시안만 후보, 기본 1), `--sem_intervals 3|2`(2이면 G2와 G3를 합쳐 평균 − 2σ 미만을 한 구간으로 둔다). `--sem_min_contrib_px x`(기본 0, 꺼짐)는 view 단위 조건으로, 그 view에서의 기여도 합(픽셀들의 alpha × T 합)을 투영 반지름으로 만든 원의 넓이 π r²로 나눈 값이 x 이상일 때만 유효 관측으로 센다. 평균과 표준편차는 이 조건을 통과한 후보 집합에서 계산한다. `run_decisive.sh`에서는 `VALID_GRAD`(기본 1), `MIN_VIEWS`, `INTERVALS`, `DINO_CHUNK`, `GT_CACHE`, `OUTDOOR_IMG`, `INDOOR_IMG`, `ITER` 환경변수로 모든 조건에 공통으로 적용한다.
 
 기본값(dino, ours, stratified, adc, shadow 없음)에서는 기존 계산과 같다. ours 모드에서 가중 합(`--sem_view_norm sum`)은 막아 두었다. goodness 점수를 합하면 넓게 덮는 가우시안일수록 잘 복원된 것으로 판정되기 때문이며, 가중 합 비교는 오차 점수를 쓰는 r9 모드에서 한다.
 

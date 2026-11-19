@@ -26,6 +26,7 @@ from utils.signal_maps import GuidanceMaps, SIGNALS ###
 from utils.sem_logger import SemLogger ###
 from utils.scale_weight_stats import scale_weight_analysis ###
 import json ###
+import math ###
 import time ###
 import random ###
 import subprocess ###
@@ -210,6 +211,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 view_visible_mask = view_visible_mask.unsqueeze(1)
 
             visible_mask = view_visible_mask * (den_grad > 1e-6)
+            if sem_cfg["min_contrib_px"] > 0:
+                # Count the view as an observation only if the Gaussian is visible enough in it:
+                # mean alpha * T over its footprint (disc of the projected 3-sigma radius).
+                footprint = math.pi * radii.detach().float().unsqueeze(1).clamp_min(1.0) ** 2
+                visible_mask = visible_mask * ((den_grad / footprint) >= sem_cfg["min_contrib_px"])
             # visible_mask = visible_mask * wma_weight
 
             gaussians.accumulate_similarity(weighted_view_score, visible_mask, agg=sem_cfg["view_agg"],
@@ -357,6 +363,8 @@ def resolve_sem_config(opt):
         raise ValueError(f"--sem_intervals must be 2 or 3, got {opt.sem_intervals}")
     if opt.sem_min_views < 1:
         raise ValueError(f"--sem_min_views must be >= 1, got {opt.sem_min_views}")
+    if opt.sem_min_contrib_px < 0:
+        raise ValueError(f"--sem_min_contrib_px must be >= 0, got {opt.sem_min_contrib_px}")
     if opt.sem_scale_mode not in ("linear", "power"):
         raise ValueError(f"--sem_scale_mode must be linear|power, got '{opt.sem_scale_mode}'")
 
@@ -388,7 +396,8 @@ def resolve_sem_config(opt):
         "collect_stats": bool(opt.sem_log),
     }
     cfg = {"mode": mode, "signal": opt.sem_signal, "shadow": opt.sem_shadow,
-           "view_norm": view_norm, "view_agg": view_agg, "scale_mode": opt.sem_scale_mode, "densify": densify_cfg}
+           "view_norm": view_norm, "view_agg": view_agg, "scale_mode": opt.sem_scale_mode,
+           "min_contrib_px": float(opt.sem_min_contrib_px), "densify": densify_cfg}
     print(f"[sem] config: {json.dumps(cfg)}")
     return cfg
 

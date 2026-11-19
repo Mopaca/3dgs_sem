@@ -293,13 +293,16 @@ def test_resolve_config():
     base = dict(sem_mode="ours", sem_signal="dino", sem_shadow="none", sem_select="stratified", sem_split="adc",
                 sem_view_norm="auto", sem_view_agg="auto", sem_sample_ratio=0.3, sem_r9_threshold=0.1, sem_r9_cap=0.05,
                 sem_radius_max=20.0, sem_lambda_scale=0.3, sem_log=False, sem_scale_mode="linear",
-                sem_valid_grad=False, sem_min_views=1, sem_intervals=3)
+                sem_valid_grad=False, sem_min_views=1, sem_intervals=3, sem_min_contrib_px=0.0)
     cfg = ns["resolve_sem_config"](SimpleNamespace(**base))
     check(cfg["view_norm"] == "mean" and cfg["view_agg"] == "mean", "ours: auto -> mean / mean")
     cfg = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_mode="r9", sem_lambda_scale=0.0)))
     check(cfg["view_norm"] == "sum" and cfg["view_agg"] == "max", "r9: auto -> sum / max")
     d = ns["resolve_sem_config"](SimpleNamespace(**base))["densify"]
     check(d["valid_grad"] is False and d["min_views"] == 1 and d["intervals"] == 3, "defaults: valid_grad off, min_views 1, 3 intervals")
+    c0 = ns["resolve_sem_config"](SimpleNamespace(**base))
+    c1 = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_min_contrib_px=3e-4)))
+    check(c0["min_contrib_px"] == 0.0 and abs(c1["min_contrib_px"] - 3e-4) < 1e-12, "min_contrib_px: default 0 (off), value passed through")
     d = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_valid_grad=True, sem_min_views=2, sem_intervals=2)))["densify"]
     check(d["valid_grad"] is True and d["min_views"] == 2 and d["intervals"] == 2, "valid_grad / min_views / intervals are passed to the densify config")
     line = ns["sem_console_line"](3000, {"n_total": 1234567, "n_grad": 1200, "n_sem": 300, "n_sem_only": 120,
