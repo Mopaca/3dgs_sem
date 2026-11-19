@@ -15,6 +15,7 @@
 
 import ast
 import json
+import math
 import os
 import subprocess
 import sys
@@ -119,7 +120,8 @@ def random_step_inputs(n, seed):
         "sim_score_accum": score * count,
         "sim_view_count": count,
         "sim_diag_accum": torch.cat([torch.rand((n, 1), generator=g) * 40, torch.rand((n, 1), generator=g) * 0.3 + 0.7,
-                                     score], dim=1) * count,
+                                     score, torch.rand((n, 1), generator=g) * 50,
+                                     torch.rand((n, 1), generator=g) * 0.2], dim=1) * count,
         "max_radii2D": torch.rand((n,), generator=g) * 40,
         "radii": (torch.rand((n,), generator=g) * 40).int(),
     }
@@ -176,7 +178,7 @@ def test_full_step_equivalence():
             same = all(so[k].shape == sn[k].shape and torch.equal(so[k], sn[k]) for k in so)
             check(same, f"step {step}: identical Gaussians after densify+prune "
                         f"(N {n} -> {new.get_xyz.shape[0]}, collect_stats={collect})")
-            check(new.sim_diag_accum.shape == (new.get_xyz.shape[0], 3), f"step {step}: sim_diag_accum shape tracks N")
+            check(new.sim_diag_accum.shape == (new.get_xyz.shape[0], new_mod.DIAG_COLS), f"step {step}: sim_diag_accum shape tracks N")
             if collect:
                 check(stats is not None and stats["n_union"] == stats["n_grad"] + stats["n_sem"] - stats["n_inter"],
                       f"step {step}: stats consistent (n_sem={stats['n_sem']}, n_sem_only={stats['n_sem_only']}, "
@@ -206,15 +208,19 @@ def test_accumulate():
         mod = cpu_module(f.read(), "gaussian_model_acc")
     m = mod.GaussianModel(3)
     n = 50
-    m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1)); m.sim_diag_accum = torch.zeros((n, 3))
+    m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1)); m.sim_diag_accum = torch.zeros((n, mod.DIAG_COLS))
     ref_acc = torch.zeros((n, 1)); ref_cnt = torch.zeros((n, 1))
     g = torch.Generator().manual_seed(0)
     views = [(torch.rand((n, 1), generator=g), (torch.rand((n, 1), generator=g) > 0.3).float()) for _ in range(7)]
     for s, v in views:
-        m.accumulate_similarity(s, v, agg="mean", radius=torch.ones((n, 1)) * 3)
+        m.accumulate_similarity(s, v, agg="mean", radius=torch.ones((n, 1)) * 3, contrib=torch.ones((n, 1)) * 2)
         ref_acc += s * v; ref_cnt += v
     check(torch.equal(m.sim_score_accum, ref_acc) and torch.equal(m.sim_view_count, ref_cnt), "mean == previous implementation")
     check(torch.allclose(m.get_mean_projected_radius()[ref_cnt.squeeze(1) > 0], torch.tensor(3.0)), "mean projected radius")
+    seen = ref_cnt.squeeze(1) > 0
+    check(torch.allclose(m.get_mean_contribution()[seen], torch.tensor(2.0))
+          and torch.allclose(m.get_mean_contribution_per_pixel()[seen], torch.tensor(2.0 / (math.pi * 9.0))),
+          "mean contribution sum and contribution per footprint pixel")
     for agg, fn in (("min", torch.minimum), ("max", torch.maximum)):
         m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1))
         for s, v in views:

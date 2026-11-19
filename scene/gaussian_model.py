@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import math
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -28,6 +29,10 @@ from utils.sem_select import (select_stratified, select_random_matched, select_r
 
 # Default semantic densification config used when densify_and_prune_by_similarity is called
 # without sem_cfg (e.g. train_sim_rendersim.py). It reproduces the behaviour of commit 343c470.
+# columns of sim_diag_accum: projected radius, scale weight, unweighted score,
+# contribution sum, contribution per footprint pixel (diagnostics only, never used for selection)
+DIAG_COLS = 5
+
 DEFAULT_SEM_CFG = {
     "mode": "ours",            # ours | r9
     "select": "stratified",    # stratified | random_matched | radius_matched  (ours mode)
@@ -257,7 +262,7 @@ class GaussianModel:
         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
-        self.sim_diag_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda") ###
+        self.sim_diag_accum = torch.zeros((self.get_xyz.shape[0], DIAG_COLS), device="cuda") ###
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -409,15 +414,17 @@ class GaussianModel:
         self.sim_score_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.sim_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
         self.similarity_score = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") ###
-        self.sim_diag_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda") ###
+        self.sim_diag_accum = torch.zeros((self.get_xyz.shape[0], DIAG_COLS), device="cuda") ###
 
         self.active_sh_degree = self.max_sh_degree
 
 #####
     def _diag_ready(self, n):
-        return self.sim_diag_accum.dim() == 2 and self.sim_diag_accum.shape[0] == n
+        return (self.sim_diag_accum.dim() == 2 and self.sim_diag_accum.shape[0] == n
+                and self.sim_diag_accum.shape[1] == DIAG_COLS)
 
-    def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None, scale_weight=None, raw_score=None):
+    def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None, scale_weight=None, raw_score=None,
+                              contrib=None):
         """
         view_score:   [N, 1] weighted view score of the current view
         visible_mask: [N, 1] float, 1 for valid views (visible and contribution sum > tau_v)
@@ -426,6 +433,8 @@ class GaussianModel:
         radius:       [N, 1] projected radius of the current view (optional, for logging / radius control)
         scale_weight: [N, 1] scale weight applied in the current view (optional, diagnostics)
         raw_score:    [N, 1] view score before the scale weight, clamped to [0, 1] (optional, diagnostics)
+        contrib:      [N, 1] contribution sum of the current view, sum over pixels of alpha * T
+                      (the denominator of the weighted mean; optional, diagnostics)
         """
         if agg == "mean":
             self.sim_score_accum += view_score * visible_mask
@@ -441,6 +450,12 @@ class GaussianModel:
             for col, value in ((0, radius), (1, scale_weight), (2, raw_score)):
                 if value is not None:
                     self.sim_diag_accum[:, col:col + 1] += value * visible_mask
+            if contrib is not None:
+                self.sim_diag_accum[:, 3:4] += contrib * visible_mask
+                if radius is not None:
+                    # mean alpha * T over the footprint, approximated by a disc of the projected (3 sigma) radius
+                    area = math.pi * radius.clamp_min(1.0) ** 2
+                    self.sim_diag_accum[:, 4:5] += (contrib / area) * visible_mask
         # self.sim_score_accum += view_score
 
     def finalize_similarity_score(self, eps=1e-8, agg="mean"):
@@ -465,6 +480,14 @@ class GaussianModel:
     def get_unweighted_similarity(self):
         """[N] mean view score without the scale weight (same views, same [0, 1] clamp), 0 if unseen."""
         return self._diag_mean(2)
+
+    def get_mean_contribution(self):
+        """[N] mean contribution sum (sum of alpha * T over pixels, px units) over the valid views, 0 if unseen."""
+        return self._diag_mean(3)
+
+    def get_mean_contribution_per_pixel(self):
+        """[N] mean of contribution sum / (pi * radius^2) over the valid views, 0 if unseen."""
+        return self._diag_mean(4)
 
     def _diag_mean(self, col):
         count = self.sim_view_count.squeeze(1)
@@ -770,7 +793,7 @@ class GaussianModel:
         self.sim_view_count = torch.cat([self.sim_view_count, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
         self.similarity_score = torch.cat([self.similarity_score, torch.zeros((new_count, 1), device="cuda")], dim=0) ###
         if self._diag_ready(self.sim_score_accum.shape[0] - new_count): ###
-            self.sim_diag_accum = torch.cat([self.sim_diag_accum, torch.zeros((new_count, 3), device="cuda")], dim=0) ###
+            self.sim_diag_accum = torch.cat([self.sim_diag_accum, torch.zeros((new_count, DIAG_COLS), device="cuda")], dim=0) ###
         self._similarity_aux = nn.Parameter(torch.cat([self._similarity_aux.detach(), torch.zeros((new_count, 3), device="cuda")], dim=0).requires_grad_(True)) ###
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
@@ -1814,6 +1837,9 @@ class GaussianModel:
         union = sem | grad_mask
         small = torch.max(self.get_scaling, dim=1).values <= self.percent_dense * extent
         radius_mean = self.get_mean_projected_radius()
+        contrib_mean = self.get_mean_contribution()
+        contrib_px = self.get_mean_contribution_per_pixel()
+        opacity = self.get_opacity.squeeze(1)
 
         n_sem = int(sem.sum().item())
         stats = {
@@ -1837,6 +1863,13 @@ class GaussianModel:
             "score_sem": summarize(sim_score, sem),
             "grad_sem": summarize(grad_mag, sem),
             "grad_valid": summarize(grad_mag, sim_valid_mask),
+            # visibility diagnostics (logging only)
+            "contrib_valid": summarize(contrib_mean, sim_valid_mask),
+            "contrib_sem": summarize(contrib_mean, sem),
+            "contrib_px_valid": summarize(contrib_px, sim_valid_mask),
+            "contrib_px_sem": summarize(contrib_px, sem),
+            "opacity_valid": summarize(opacity, sim_valid_mask),
+            "opacity_sem": summarize(opacity, sem),
         }
 
         if cfg.get("want_snapshot"):
@@ -1850,6 +1883,11 @@ class GaussianModel:
                 "is_sem": sem[idx].cpu().numpy(),
                 "is_grad": grad_mask[idx].cpu().numpy(),
                 "is_small": small[idx].cpu().numpy(),
+                "opacity": opacity[idx].float().cpu().numpy(),
+                "contrib_mean": contrib_mean[idx].float().cpu().numpy(),
+                "contrib_per_px": contrib_px[idx].float().cpu().numpy(),
+                "scale_max": torch.max(self.get_scaling, dim=1).values[idx].float().cpu().numpy(),
+                "scale_min": torch.min(self.get_scaling, dim=1).values[idx].float().cpu().numpy(),
                 "tau_g": float(max_grad),
             }
         return stats

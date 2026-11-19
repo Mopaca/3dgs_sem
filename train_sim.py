@@ -215,7 +215,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.accumulate_similarity(weighted_view_score, visible_mask, agg=sem_cfg["view_agg"],
                                             radius=radii.detach().float().unsqueeze(1),
                                             scale_weight=scale_weight,
-                                            raw_score=(view_score.clamp(0.0, 1.0) if sem_cfg["mode"] == "ours" else None))
+                                            raw_score=(view_score.clamp(0.0, 1.0) if sem_cfg["mode"] == "ours" else None),
+                                            contrib=den_grad)
 
             if sem_logger.enabled:
                 shadow_view_score = None
