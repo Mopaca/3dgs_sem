@@ -1,0 +1,413 @@
+From 0b94f1de29cabb29bc166b2662d089b9db939ca7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 17:00:41 +0900
+Subject: [PATCH] Footprint area of the visibility bound: projected ellipse
+ (--sem_contrib_area)
+
+- utils/projected_area.py recomputes the 2D covariance of the visible Gaussians with
+  the rasterizer's formulas (computeCov2D, +0.3 low-pass) and returns the area of the
+  projected 3-sigma ellipse, 9 pi sqrt(det). The smallest rectangle covering the ellipse
+  has area 36 sqrt(det), i.e. the same quantity times 4 / pi.
+- --sem_contrib_area ellipse|disc (default ellipse) selects the footprint used by
+  --sem_min_contrib_px. A disc of the long-axis radius penalises elongated Gaussians.
+- Logging: contribution / ellipse area is accumulated next to the disc version
+  (sem_log: contrib_px_ellipse_*, snapshots: contrib_per_px_ellipse).
+- A one-time message compares the recomputed long-axis radius with the rasterizer's radii.
+- run_decisive.sh: CONTRIB_AREA environment variable.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PHmjveU9kNqt1TKBUX99W4
+---
+ DECISIVE_EXPERIMENT.md     |  2 +-
+ arguments/__init__.py      |  3 +-
+ run_decisive.sh            |  5 ++-
+ scene/gaussian_model.py    | 18 ++++++--
+ tests/test_decisive_cpu.py | 46 ++++++++++++++++++--
+ train_sim.py               | 34 +++++++++++++--
+ utils/projected_area.py    | 86 ++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 180 insertions(+), 14 deletions(-)
+ create mode 100644 utils/projected_area.py
+
+diff --git a/DECISIVE_EXPERIMENT.md b/DECISIVE_EXPERIMENT.md
+index 56f3e64..31b8143 100644
+--- a/DECISIVE_EXPERIMENT.md
++++ b/DECISIVE_EXPERIMENT.md
+@@ -51,7 +51,7 @@ python collect_results.py --root output/decisive
+ 
+ `--sem_signal dino|ssim|l1|l1_blur`, `--sem_mode ours|r9`, `--sem_select stratified|random_matched|radius_matched`, `--sem_view_norm auto|mean|sum`, `--sem_view_agg auto|mean|min|max`, `--sem_lambda_scale`, `--sem_radius_min`, `--sem_radius_max`, `--sem_sample_ratio`, `--sem_r9_threshold`, `--sem_r9_cap`, `--sem_blur_sigma`, `--sem_shadow`, `--sem_split adc|mask2`, `--sem_log`, 그리고 `train_sim.py`의 `--seed` (0이면 기존과 같은 고정 seed).
+ 
+-후보 집합과 구간 옵션: `--sem_valid_grad`(누적 위치 gradient가 정확히 0인 가우시안을 후보에서 제외), `--sem_min_views N`(densification 간격 안에서 N개 이상의 view에서 유효하게 관측된 가우시안만 후보, 기본 1), `--sem_intervals 3|2`(2이면 G2와 G3를 합쳐 평균 − 2σ 미만을 한 구간으로 둔다). `--sem_min_contrib_px x`(기본 0, 꺼짐)는 view 단위 조건으로, 그 view에서의 기여도 합(픽셀들의 alpha × T 합)을 투영 반지름으로 만든 원의 넓이 π r²로 나눈 값이 x 이상일 때만 유효 관측으로 센다. 평균과 표준편차는 이 조건을 통과한 후보 집합에서 계산한다. `run_decisive.sh`에서는 `VALID_GRAD`(기본 1), `MIN_VIEWS`, `INTERVALS`, `DINO_CHUNK`, `GT_CACHE`, `OUTDOOR_IMG`, `INDOOR_IMG`, `ITER` 환경변수로 모든 조건에 공통으로 적용한다.
++후보 집합과 구간 옵션: `--sem_valid_grad`(누적 위치 gradient가 정확히 0인 가우시안을 후보에서 제외), `--sem_min_views N`(densification 간격 안에서 N개 이상의 view에서 유효하게 관측된 가우시안만 후보, 기본 1), `--sem_intervals 3|2`(2이면 G2와 G3를 합쳐 평균 − 2σ 미만을 한 구간으로 둔다). `--sem_min_contrib_px x`(기본 0, 꺼짐)는 view 단위 조건으로, 그 view에서의 기여도 합(픽셀들의 alpha × T 합)을 투영 면적으로 나눈 값이 x 이상일 때만 유효 관측으로 센다. 투영 면적은 `--sem_contrib_area ellipse`(기본)이면 투영된 3σ 타원의 넓이 9π√det(Σ₂D), `disc`이면 투영 반지름으로 만든 원의 넓이 π r²이다. 타원을 덮는 가장 작은 직사각형의 넓이는 36√det(Σ₂D)로 타원 넓이의 4/π배이므로, 직사각형 기준의 임계값은 타원 기준 임계값에 π/4를 곱한 값과 같다. 2D 공분산은 rasterizer가 반환하지 않아 `utils/projected_area.py`에서 같은 식으로 다시 계산한다. 평균과 표준편차는 이 조건을 통과한 후보 집합에서 계산한다. `run_decisive.sh`에서는 `VALID_GRAD`(기본 1), `MIN_VIEWS`, `INTERVALS`, `DINO_CHUNK`, `GT_CACHE`, `OUTDOOR_IMG`, `INDOOR_IMG`, `ITER` 환경변수로 모든 조건에 공통으로 적용한다.
+ 
+ 기본값(dino, ours, stratified, adc, shadow 없음)에서는 기존 계산과 같다. ours 모드에서 가중 합(`--sem_view_norm sum`)은 막아 두었다. goodness 점수를 합하면 넓게 덮는 가우시안일수록 잘 복원된 것으로 판정되기 때문이며, 가중 합 비교는 오차 점수를 쓰는 r9 모드에서 한다.
+ 
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index 48155af..f1b0d31 100644
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -117,7 +117,8 @@ class OptimizationParams(ParamGroup):
+         self.sem_valid_grad = False       # True: Gaussians whose accumulated positional gradient is exactly 0 are not candidates
+         self.sem_min_views = 1            # candidates must be observed in at least this many views of the densification interval
+         self.sem_intervals = 3            # 3: G1/G2/G3 (proposed) | 2: G1 and (G2+G3 merged, score < mean - 2 std)
+-        self.sem_min_contrib_px = 0.0     # >0: a view counts as an observation only if contribution sum / (pi * radius^2) >= this value
++        self.sem_min_contrib_px = 0.0     # >0: a view counts as an observation only if contribution sum / footprint area >= this value
++        self.sem_contrib_area = "ellipse" # footprint area: ellipse (projected 3-sigma ellipse) | disc (pi * radius^2)
+         self.sem_blur_sigma = 4.0         # l1_blur: Gaussian blur sigma (px)
+         self.sem_shadow = "none"          # extra signal back-projected through the 3rd aux channel (logging only)
+         self.sem_split = "adc"            # adc (densify_and_split_by_selected_mask) | mask2
+diff --git a/run_decisive.sh b/run_decisive.sh
+index 8df0da3..76d6ddd 100644
+--- a/run_decisive.sh
++++ b/run_decisive.sh
+@@ -39,7 +39,8 @@ SPLIT=${SPLIT:-adc}      # densify_and_split_by_selected_mask (used for the repo
+ VALID_GRAD=${VALID_GRAD:-1}   # 1: exclude Gaussians with zero accumulated positional gradient (--sem_valid_grad)
+ MIN_VIEWS=${MIN_VIEWS:-1}     # minimum number of valid views per densification interval (--sem_min_views)
+ INTERVALS=${INTERVALS:-3}     # 3: G1/G2/G3 | 2: G2 and G3 merged (--sem_intervals)
+-MIN_CONTRIB_PX=${MIN_CONTRIB_PX:-0}   # >0: per-view visibility bound, contribution sum / (pi r^2) (--sem_min_contrib_px)
++MIN_CONTRIB_PX=${MIN_CONTRIB_PX:-0}   # >0: per-view visibility bound, contribution sum / footprint area (--sem_min_contrib_px)
++CONTRIB_AREA=${CONTRIB_AREA:-ellipse} # footprint area: ellipse (projected 3-sigma ellipse) | disc (pi r^2)
+ DINO_CHUNK=${DINO_CHUNK:-64}  # channel chunk of the DINOv2 feature upsampling (0: original path)
+ GT_CACHE=${GT_CACHE:-cpu}     # GT DINOv2 feature cache: none | cpu | cuda
+ OUTDOOR_IMG=${OUTDOOR_IMG:-images_4}   # Mip-NeRF 360 outdoor image folder (images_8 for a small local GPU)
+@@ -54,7 +55,7 @@ ITER=${ITER:-30000}      # ITER=15000 stops right after the densification phase
+ COMMON="--eval --disable_viewer --test_iterations -1 --iterations $ITER --save_iterations $ITER \
+ --densify_grad_threshold $TAU_G --sem_sample_ratio $RHO --sem_split $SPLIT --sem_log \
+ --sem_dino_chunk $DINO_CHUNK --sem_dino_gt_cache $GT_CACHE --sem_min_views $MIN_VIEWS --sem_intervals $INTERVALS \
+---sem_min_contrib_px $MIN_CONTRIB_PX"
++--sem_min_contrib_px $MIN_CONTRIB_PX --sem_contrib_area $CONTRIB_AREA"
+ if [ "$VALID_GRAD" = 1 ]; then COMMON="$COMMON --sem_valid_grad"; fi
+ 
+ M360_OUTDOOR="bicycle flowers garden stump treehill"
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index 41e0136..b6cedda 100644
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -30,8 +30,9 @@ from utils.sem_select import (select_stratified, select_random_matched, select_r
+ # Default semantic densification config used when densify_and_prune_by_similarity is called
+ # without sem_cfg (e.g. train_sim_rendersim.py). It reproduces the behaviour of commit 343c470.
+ # columns of sim_diag_accum: projected radius, scale weight, unweighted score,
+-# contribution sum, contribution per footprint pixel (diagnostics only, never used for selection)
+-DIAG_COLS = 5
++# contribution sum, contribution / disc area, contribution / ellipse area
++# (diagnostics only, never used for selection)
++DIAG_COLS = 6
+ 
+ DEFAULT_SEM_CFG = {
+     "mode": "ours",            # ours | r9
+@@ -424,7 +425,7 @@ class GaussianModel:
+                 and self.sim_diag_accum.shape[1] == DIAG_COLS)
+ 
+     def accumulate_similarity(self, view_score, visible_mask, agg="mean", radius=None, scale_weight=None, raw_score=None,
+-                              contrib=None):
++                              contrib=None, ellipse_area=None):
+         """
+         view_score:   [N, 1] weighted view score of the current view
+         visible_mask: [N, 1] float, 1 for valid views (visible and contribution sum > tau_v)
+@@ -435,6 +436,7 @@ class GaussianModel:
+         raw_score:    [N, 1] view score before the scale weight, clamped to [0, 1] (optional, diagnostics)
+         contrib:      [N, 1] contribution sum of the current view, sum over pixels of alpha * T
+                       (the denominator of the weighted mean; optional, diagnostics)
++        ellipse_area: [N, 1] area of the projected 3-sigma ellipse in the current view (optional, diagnostics)
+         """
+         if agg == "mean":
+             self.sim_score_accum += view_score * visible_mask
+@@ -456,6 +458,8 @@ class GaussianModel:
+                     # mean alpha * T over the footprint, approximated by a disc of the projected (3 sigma) radius
+                     area = math.pi * radius.clamp_min(1.0) ** 2
+                     self.sim_diag_accum[:, 4:5] += (contrib / area) * visible_mask
++                if ellipse_area is not None:
++                    self.sim_diag_accum[:, 5:6] += (contrib / ellipse_area.clamp_min(1e-6)) * visible_mask
+         # self.sim_score_accum += view_score
+ 
+     def finalize_similarity_score(self, eps=1e-8, agg="mean"):
+@@ -489,6 +493,10 @@ class GaussianModel:
+         """[N] mean of contribution sum / (pi * radius^2) over the valid views, 0 if unseen."""
+         return self._diag_mean(4)
+ 
++    def get_mean_contribution_per_ellipse_pixel(self):
++        """[N] mean of contribution sum / area of the projected 3-sigma ellipse over the valid views."""
++        return self._diag_mean(5)
++
+     def _diag_mean(self, col):
+         count = self.sim_view_count.squeeze(1)
+         if not self._diag_ready(count.shape[0]):
+@@ -1839,6 +1847,7 @@ class GaussianModel:
+         radius_mean = self.get_mean_projected_radius()
+         contrib_mean = self.get_mean_contribution()
+         contrib_px = self.get_mean_contribution_per_pixel()
++        contrib_px_ellipse = self.get_mean_contribution_per_ellipse_pixel()
+         opacity = self.get_opacity.squeeze(1)
+ 
+         n_sem = int(sem.sum().item())
+@@ -1868,6 +1877,8 @@ class GaussianModel:
+             "contrib_sem": summarize(contrib_mean, sem),
+             "contrib_px_valid": summarize(contrib_px, sim_valid_mask),
+             "contrib_px_sem": summarize(contrib_px, sem),
++            "contrib_px_ellipse_valid": summarize(contrib_px_ellipse, sim_valid_mask),
++            "contrib_px_ellipse_sem": summarize(contrib_px_ellipse, sem),
+             "opacity_valid": summarize(opacity, sim_valid_mask),
+             "opacity_sem": summarize(opacity, sem),
+         }
+@@ -1886,6 +1897,7 @@ class GaussianModel:
+                 "opacity": opacity[idx].float().cpu().numpy(),
+                 "contrib_mean": contrib_mean[idx].float().cpu().numpy(),
+                 "contrib_per_px": contrib_px[idx].float().cpu().numpy(),
++                "contrib_per_px_ellipse": contrib_px_ellipse[idx].float().cpu().numpy(),
+                 "scale_max": torch.max(self.get_scaling, dim=1).values[idx].float().cpu().numpy(),
+                 "scale_min": torch.min(self.get_scaling, dim=1).values[idx].float().cpu().numpy(),
+                 "tau_g": float(max_grad),
+diff --git a/tests/test_decisive_cpu.py b/tests/test_decisive_cpu.py
+index f15d329..c30fb24 100644
+--- a/tests/test_decisive_cpu.py
++++ b/tests/test_decisive_cpu.py
+@@ -121,7 +121,8 @@ def random_step_inputs(n, seed):
+         "sim_view_count": count,
+         "sim_diag_accum": torch.cat([torch.rand((n, 1), generator=g) * 40, torch.rand((n, 1), generator=g) * 0.3 + 0.7,
+                                      score, torch.rand((n, 1), generator=g) * 50,
+-                                     torch.rand((n, 1), generator=g) * 0.2], dim=1) * count,
++                                     torch.rand((n, 1), generator=g) * 0.2,
++                                     torch.rand((n, 1), generator=g) * 0.3], dim=1) * count,
+         "max_radii2D": torch.rand((n,), generator=g) * 40,
+         "radii": (torch.rand((n,), generator=g) * 40).int(),
+     }
+@@ -213,7 +214,8 @@ def test_accumulate():
+     g = torch.Generator().manual_seed(0)
+     views = [(torch.rand((n, 1), generator=g), (torch.rand((n, 1), generator=g) > 0.3).float()) for _ in range(7)]
+     for s, v in views:
+-        m.accumulate_similarity(s, v, agg="mean", radius=torch.ones((n, 1)) * 3, contrib=torch.ones((n, 1)) * 2)
++        m.accumulate_similarity(s, v, agg="mean", radius=torch.ones((n, 1)) * 3, contrib=torch.ones((n, 1)) * 2,
++                                ellipse_area=torch.ones((n, 1)) * 8)
+         ref_acc += s * v; ref_cnt += v
+     check(torch.equal(m.sim_score_accum, ref_acc) and torch.equal(m.sim_view_count, ref_cnt), "mean == previous implementation")
+     check(torch.allclose(m.get_mean_projected_radius()[ref_cnt.squeeze(1) > 0], torch.tensor(3.0)), "mean projected radius")
+@@ -221,6 +223,44 @@ def test_accumulate():
+     check(torch.allclose(m.get_mean_contribution()[seen], torch.tensor(2.0))
+           and torch.allclose(m.get_mean_contribution_per_pixel()[seen], torch.tensor(2.0 / (math.pi * 9.0))),
+           "mean contribution sum and contribution per footprint pixel")
++    check(torch.allclose(m.get_mean_contribution_per_ellipse_pixel()[seen], torch.tensor(0.25)), "contribution per ellipse pixel")
++
++    # projected ellipse area: same 2D covariance as the rasterizer formula J W Sigma W^T J^T (+0.3)
++    from utils import projected_area
++    g = torch.Generator().manual_seed(1)
++    k = 200
++    xyz = torch.rand((k, 3), generator=g, dtype=torch.float64) * 2 - 1
++    xyz[:, 2] += 4.0
++    scal = torch.rand((k, 3), generator=g, dtype=torch.float64) * 0.05 + 0.002
++    quat = torch.nn.functional.normalize(torch.randn((k, 4), generator=g, dtype=torch.float64), dim=1)
++    ang = 0.3
++    Rc = torch.tensor([[math.cos(ang), 0, math.sin(ang)], [0, 1, 0], [-math.sin(ang), 0, math.cos(ang)]], dtype=torch.float64)
++    tc = torch.tensor([0.1, -0.2, 0.5], dtype=torch.float64)
++    M = torch.eye(4, dtype=torch.float64); M[:3, :3] = Rc.t(); M[3, :3] = tc      # row-vector convention
++    cam = SimpleNamespace(FoVx=1.0, FoVy=0.7, image_width=1200, image_height=800, world_view_transform=M)
++    area, rad = projected_area.projected_ellipse_area(xyz, scal, quat, cam)
++    tfx, tfy = math.tan(0.5), math.tan(0.35)
++    fx, fy = 1200 / (2 * tfx), 800 / (2 * tfy)
++    ref_area = torch.zeros(k, dtype=torch.float64); ref_rad = torch.zeros(k, dtype=torch.float64)
++    for i in range(k):
++        t = Rc @ xyz[i] + tc
++        tx = min(1.3 * tfx, max(-1.3 * tfx, (t[0] / t[2]).item())) * t[2]
++        ty = min(1.3 * tfy, max(-1.3 * tfy, (t[1] / t[2]).item())) * t[2]
++        J = torch.tensor([[fx / t[2], 0, -fx * tx / t[2] ** 2], [0, fy / t[2], -fy * ty / t[2] ** 2]], dtype=torch.float64)
++        Rq = projected_area._quat_to_rotmat(quat[i:i + 1])[0]
++        Sig = Rq @ torch.diag(scal[i] ** 2) @ Rq.t()
++        c2 = J @ Rc @ Sig @ Rc.t() @ J.t() + 0.3 * torch.eye(2, dtype=torch.float64)
++        ev = torch.linalg.eigvalsh(c2)
++        ref_area[i] = 9 * math.pi * torch.sqrt(ev[0] * ev[1])
++        mid = 0.5 * (c2[0, 0] + c2[1, 1]); det = torch.linalg.det(c2)
++        ref_rad[i] = torch.ceil(3 * torch.sqrt(mid + torch.sqrt(torch.clamp(mid * mid - det, min=0.1))))
++    check(torch.allclose(area, ref_area, rtol=1e-9) and torch.equal(rad, ref_rad), "projected ellipse area and radius == explicit J W Sigma W^T J^T")
++    iso = projected_area.projected_ellipse_area(torch.tensor([[0.0, 0.0, 5.0]], dtype=torch.float64), torch.full((1, 3), 0.01, dtype=torch.float64),
++                                                torch.tensor([[1.0, 0, 0, 0]], dtype=torch.float64),
++                                                SimpleNamespace(FoVx=1.0, FoVy=0.7, image_width=1200, image_height=800,
++                                                                world_view_transform=torch.eye(4, dtype=torch.float64)))[0]
++    sig_px = 0.01 * fx / 5.0
++    check(abs(iso.item() - 9 * math.pi * math.sqrt((sig_px ** 2 + 0.3) * ((0.01 * fy / 5.0) ** 2 + 0.3))) < 1e-6, "isotropic Gaussian on the optical axis: area = 9 pi sqrt(det)")
+     for agg, fn in (("min", torch.minimum), ("max", torch.maximum)):
+         m.sim_score_accum = torch.zeros((n, 1)); m.sim_view_count = torch.zeros((n, 1))
+         for s, v in views:
+@@ -293,7 +333,7 @@ def test_resolve_config():
+     base = dict(sem_mode="ours", sem_signal="dino", sem_shadow="none", sem_select="stratified", sem_split="adc",
+                 sem_view_norm="auto", sem_view_agg="auto", sem_sample_ratio=0.3, sem_r9_threshold=0.1, sem_r9_cap=0.05,
+                 sem_radius_max=20.0, sem_lambda_scale=0.3, sem_log=False, sem_scale_mode="linear",
+-                sem_valid_grad=False, sem_min_views=1, sem_intervals=3, sem_min_contrib_px=0.0)
++                sem_valid_grad=False, sem_min_views=1, sem_intervals=3, sem_min_contrib_px=0.0, sem_contrib_area="ellipse")
+     cfg = ns["resolve_sem_config"](SimpleNamespace(**base))
+     check(cfg["view_norm"] == "mean" and cfg["view_agg"] == "mean", "ours: auto -> mean / mean")
+     cfg = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_mode="r9", sem_lambda_scale=0.0)))
+diff --git a/train_sim.py b/train_sim.py
+index db73681..617101a 100644
+--- a/train_sim.py
++++ b/train_sim.py
+@@ -25,6 +25,7 @@ from utils.percentile_utils import get_priority_top_percent, get_dynamic_priorit
+ from utils.signal_maps import GuidanceMaps, SIGNALS ###
+ from utils.sem_logger import SemLogger ###
+ from utils.scale_weight_stats import scale_weight_analysis ###
++from utils.projected_area import projected_ellipse_area ###
+ import json ###
+ import math ###
+ import time ###
+@@ -69,6 +70,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+     guidance = GuidanceMaps([sem_cfg["signal"], sem_cfg["shadow"]], device="cuda", blur_sigma=opt.sem_blur_sigma, dino_chunk=opt.sem_dino_chunk, dino_gt_cache=opt.sem_dino_gt_cache) ###
+     gaussians.training_setup(opt)
+     sem_logger = SemLogger(scene.model_path, enabled=opt.sem_log) ###
++    ellipse_checked = False ###
+     save_run_config(scene.model_path, dataset, opt, pipe, sem_cfg, run_info) ###
+     priority_cutoff = None
+     if checkpoint:
+@@ -211,10 +213,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                 view_visible_mask = view_visible_mask.unsqueeze(1)
+ 
+             visible_mask = view_visible_mask * (den_grad > 1e-6)
++
++            # Footprint of each Gaussian in this view (px^2). The ellipse area needs the 2D covariance,
++            # which the rasterizer does not return, so it is recomputed for the visible Gaussians.
++            radius_px = radii.detach().float().unsqueeze(1)
++            disc_area = math.pi * radius_px.clamp_min(1.0) ** 2
++            ellipse_area = None
++            need_ellipse = sem_logger.enabled or (sem_cfg["min_contrib_px"] > 0 and sem_cfg["contrib_area"] == "ellipse")
++            if need_ellipse:
++                vis_idx = torch.nonzero(visibility_filter, as_tuple=False).squeeze(1)
++                area_vis, radius_vis = projected_ellipse_area(gaussians.get_xyz.detach()[vis_idx],
++                                                              gaussians.get_scaling.detach()[vis_idx],
++                                                              gaussians.get_rotation.detach()[vis_idx], viewpoint_cam)
++                ellipse_area = disc_area.clone()
++                ellipse_area[vis_idx, 0] = area_vis
++                if not ellipse_checked:
++                    # one-time check against the rasterizer: the long-axis radius must agree
++                    ellipse_checked = True
++                    diff = (radius_vis - radius_px[vis_idx, 0]).abs()
++                    print(f"[sem] ellipse footprint check: radius equal for {(diff < 0.5).float().mean().item() * 100:.2f}% "
++                          f"of {vis_idx.numel()} visible Gaussians, max |diff| = {diff.max().item():.1f} px")
++
+             if sem_cfg["min_contrib_px"] > 0:
+                 # Count the view as an observation only if the Gaussian is visible enough in it:
+-                # mean alpha * T over its footprint (disc of the projected 3-sigma radius).
+-                footprint = math.pi * radii.detach().float().unsqueeze(1).clamp_min(1.0) ** 2
++                # mean alpha * T over its footprint.
++                footprint = ellipse_area if sem_cfg["contrib_area"] == "ellipse" else disc_area
+                 visible_mask = visible_mask * ((den_grad / footprint) >= sem_cfg["min_contrib_px"])
+             # visible_mask = visible_mask * wma_weight
+ 
+@@ -222,7 +245,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                                             radius=radii.detach().float().unsqueeze(1),
+                                             scale_weight=scale_weight,
+                                             raw_score=(view_score.clamp(0.0, 1.0) if sem_cfg["mode"] == "ours" else None),
+-                                            contrib=den_grad)
++                                            contrib=den_grad, ellipse_area=ellipse_area)
+ 
+             if sem_logger.enabled:
+                 shadow_view_score = None
+@@ -363,6 +386,8 @@ def resolve_sem_config(opt):
+         raise ValueError(f"--sem_intervals must be 2 or 3, got {opt.sem_intervals}")
+     if opt.sem_min_views < 1:
+         raise ValueError(f"--sem_min_views must be >= 1, got {opt.sem_min_views}")
++    if opt.sem_contrib_area not in ("ellipse", "disc"):
++        raise ValueError(f"--sem_contrib_area must be ellipse|disc, got '{opt.sem_contrib_area}'")
+     if opt.sem_min_contrib_px < 0:
+         raise ValueError(f"--sem_min_contrib_px must be >= 0, got {opt.sem_min_contrib_px}")
+     if opt.sem_scale_mode not in ("linear", "power"):
+@@ -397,7 +422,8 @@ def resolve_sem_config(opt):
+     }
+     cfg = {"mode": mode, "signal": opt.sem_signal, "shadow": opt.sem_shadow,
+            "view_norm": view_norm, "view_agg": view_agg, "scale_mode": opt.sem_scale_mode,
+-           "min_contrib_px": float(opt.sem_min_contrib_px), "densify": densify_cfg}
++           "min_contrib_px": float(opt.sem_min_contrib_px), "contrib_area": opt.sem_contrib_area,
++           "densify": densify_cfg}
+     print(f"[sem] config: {json.dumps(cfg)}")
+     return cfg
+ 
+diff --git a/utils/projected_area.py b/utils/projected_area.py
+new file mode 100644
+index 0000000..b6be3bf
+--- /dev/null
++++ b/utils/projected_area.py
+@@ -0,0 +1,86 @@
++#
++# Projected (screen-space) footprint of each Gaussian, computed in PyTorch with the same
++# formulas as the rasterizer (cuda_rasterizer/forward.cu: computeCov2D and the radius).
++#
++# The rasterizer only returns the integer radius of the long axis. For the visibility
++# measure "contribution sum / footprint area" a disc of that radius over-estimates the
++# footprint of elongated Gaussians, so the area of the projected 3-sigma ellipse is used:
++#
++#     area = pi * (3 sqrt(l1)) * (3 sqrt(l2)) = 9 pi sqrt(det(cov2D))
++#
++# The smallest (oriented) rectangle that covers this ellipse has area 36 sqrt(det(cov2D)),
++# i.e. the same quantity up to the constant factor 4 / pi.
++#
++
++import math
++
++import torch
++
++
++def _quat_to_rotmat(q):
++    """q: [n, 4] (w, x, y, z), normalised. Same convention as utils.general_utils.build_rotation."""
++    r, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
++    R = torch.stack([
++        1 - 2 * (y * y + z * z), 2 * (x * y - r * z), 2 * (x * z + r * y),
++        2 * (x * y + r * z), 1 - 2 * (x * x + z * z), 2 * (y * z - r * x),
++        2 * (x * z - r * y), 2 * (y * z + r * x), 1 - 2 * (x * x + y * y),
++    ], dim=1)
++    return R.view(-1, 3, 3)
++
++
++@torch.no_grad()
++def projected_cov2d(xyz, scaling, rotation, world_view_transform, tanfovx, tanfovy, width, height):
++    """
++    2D covariance of the projected Gaussians, identical to computeCov2D (including the
++    +0.3 low-pass term on the diagonal).
++
++    Args:
++        xyz:      [n, 3] centres (world)
++        scaling:  [n, 3] activated scales
++        rotation: [n, 4] normalised quaternions (w, x, y, z)
++        world_view_transform: [4, 4] as stored by scene.cameras.Camera (row-vector convention)
++    Returns:
++        a, b, c: [n] elements of [[a, b], [b, c]]
++    """
++    M = world_view_transform
++    Rm = M[:3, :3]                      # p_view = p_world @ Rm + M[3, :3]
++    t = xyz @ Rm + M[3, :3]
++    tz = t[:, 2]
++    limx, limy = 1.3 * tanfovx, 1.3 * tanfovy
++    tx = torch.clamp(t[:, 0] / tz, -limx, limx) * tz
++    ty = torch.clamp(t[:, 1] / tz, -limy, limy) * tz
++    fx = width / (2.0 * tanfovx)
++    fy = height / (2.0 * tanfovy)
++
++    Rc = Rm.t()                         # camera rotation (rows = camera axes in world coordinates)
++    # rows of J @ Rc, one pair per Gaussian
++    m1 = (fx / tz).unsqueeze(1) * Rc[0].unsqueeze(0) - (fx * tx / (tz * tz)).unsqueeze(1) * Rc[2].unsqueeze(0)
++    m2 = (fy / tz).unsqueeze(1) * Rc[1].unsqueeze(0) - (fy * ty / (tz * tz)).unsqueeze(1) * Rc[2].unsqueeze(0)
++
++    R = _quat_to_rotmat(rotation)       # Sigma = R S S^T R^T
++    u1 = torch.einsum("ni,nij->nj", m1, R) * scaling
++    u2 = torch.einsum("ni,nij->nj", m2, R) * scaling
++    a = (u1 * u1).sum(dim=1) + 0.3
++    b = (u1 * u2).sum(dim=1)
++    c = (u2 * u2).sum(dim=1) + 0.3
++    return a, b, c
++
++
++@torch.no_grad()
++def projected_ellipse_area(xyz, scaling, rotation, camera):
++    """
++    Returns:
++        area:   [n] area (px^2) of the projected 3-sigma ellipse, 9 pi sqrt(det)
++        radius: [n] long-axis radius computed like the rasterizer, ceil(3 sqrt(lambda_max));
++                used only to check this function against the rasterizer's radii
++    """
++    tanfovx = math.tan(camera.FoVx * 0.5)
++    tanfovy = math.tan(camera.FoVy * 0.5)
++    a, b, c = projected_cov2d(xyz, scaling, rotation, camera.world_view_transform,
++                              tanfovx, tanfovy, int(camera.image_width), int(camera.image_height))
++    det = a * c - b * b
++    area = 9.0 * math.pi * torch.sqrt(det.clamp_min(1e-12))
++    mid = 0.5 * (a + c)
++    lam_max = mid + torch.sqrt((mid * mid - det).clamp_min(0.1))
++    radius = torch.ceil(3.0 * torch.sqrt(lam_max))
++    return area, radius
+-- 
+2.43.0
+

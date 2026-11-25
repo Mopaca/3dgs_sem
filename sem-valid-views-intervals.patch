@@ -1,0 +1,296 @@
+From 90e23b42cb64de7b0d72051bc7dd2d9a47f5b24a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 13:11:57 +0900
+Subject: [PATCH] Candidate-set options: --sem_valid_grad, --sem_min_views,
+ --sem_intervals
+
+- --sem_valid_grad: Gaussians whose accumulated positional gradient is exactly 0
+  are not semantic candidates (replaces the hard-coded condition; default off).
+- --sem_min_views N: candidates must be observed in at least N valid views of the
+  densification interval (default 1 = previous condition).
+- --sem_intervals 3|2: 2 merges G2 and G3 into one interval (score < mean - 2 std).
+- mean / std of the score are computed over the candidate set after these conditions.
+- run_decisive.sh: VALID_GRAD (default 1), MIN_VIEWS, INTERVALS, DINO_CHUNK, GT_CACHE,
+  OUTDOOR_IMG, INDOOR_IMG, ITER environment variables, applied to every arm.
+- tests: new cases; resolve_sem_config test gets the missing sem_scale_mode field.
+
+Defaults reproduce commit 343c470 (tests/test_decisive_cpu.py).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PHmjveU9kNqt1TKBUX99W4
+---
+ DECISIVE_EXPERIMENT.md     |  2 ++
+ arguments/__init__.py      |  3 +++
+ run_decisive.sh            | 21 ++++++++++++++++-----
+ scene/gaussian_model.py    | 19 ++++++++++++++-----
+ tests/test_decisive_cpu.py | 18 ++++++++++++++++--
+ train_sim.py               |  7 +++++++
+ utils/sem_select.py        | 28 +++++++++++++++++++---------
+ 7 files changed, 77 insertions(+), 21 deletions(-)
+
+diff --git a/DECISIVE_EXPERIMENT.md b/DECISIVE_EXPERIMENT.md
+index 6378800..729ba29 100644
+--- a/DECISIVE_EXPERIMENT.md
++++ b/DECISIVE_EXPERIMENT.md
+@@ -51,6 +51,8 @@ python collect_results.py --root output/decisive
+ 
+ `--sem_signal dino|ssim|l1|l1_blur`, `--sem_mode ours|r9`, `--sem_select stratified|random_matched|radius_matched`, `--sem_view_norm auto|mean|sum`, `--sem_view_agg auto|mean|min|max`, `--sem_lambda_scale`, `--sem_radius_min`, `--sem_radius_max`, `--sem_sample_ratio`, `--sem_r9_threshold`, `--sem_r9_cap`, `--sem_blur_sigma`, `--sem_shadow`, `--sem_split adc|mask2`, `--sem_log`, 그리고 `train_sim.py`의 `--seed` (0이면 기존과 같은 고정 seed).
+ 
++후보 집합과 구간 옵션: `--sem_valid_grad`(누적 위치 gradient가 정확히 0인 가우시안을 후보에서 제외), `--sem_min_views N`(densification 간격 안에서 N개 이상의 view에서 유효하게 관측된 가우시안만 후보, 기본 1), `--sem_intervals 3|2`(2이면 G2와 G3를 합쳐 평균 − 2σ 미만을 한 구간으로 둔다). 평균과 표준편차는 이 조건을 통과한 후보 집합에서 계산한다. `run_decisive.sh`에서는 `VALID_GRAD`(기본 1), `MIN_VIEWS`, `INTERVALS`, `DINO_CHUNK`, `GT_CACHE`, `OUTDOOR_IMG`, `INDOOR_IMG`, `ITER` 환경변수로 모든 조건에 공통으로 적용한다.
++
+ 기본값(dino, ours, stratified, adc, shadow 없음)에서는 기존 계산과 같다. ours 모드에서 가중 합(`--sem_view_norm sum`)은 막아 두었다. goodness 점수를 합하면 넓게 덮는 가우시안일수록 잘 복원된 것으로 판정되기 때문이며, 가중 합 비교는 오차 점수를 쓰는 r9 모드에서 한다.
+ 
+ ## scale weight 진단 (리뷰 4순위)
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index a31a08d..2e3cc07 100644
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -114,6 +114,9 @@ class OptimizationParams(ParamGroup):
+         self.sem_r9_cap = 0.05            # r9 mode: max fraction of Gaussians added per step
+         self.sem_dino_chunk = 0           # >0: upsample DINOv2 features in channel chunks of this size (less VRAM)
+         self.sem_dino_gt_cache = "none"   # GT DINOv2 feature cache: none | cpu | cuda
++        self.sem_valid_grad = False       # True: Gaussians whose accumulated positional gradient is exactly 0 are not candidates
++        self.sem_min_views = 1            # candidates must be observed in at least this many views of the densification interval
++        self.sem_intervals = 3            # 3: G1/G2/G3 (proposed) | 2: G1 and (G2+G3 merged, score < mean - 2 std)
+         self.sem_blur_sigma = 4.0         # l1_blur: Gaussian blur sigma (px)
+         self.sem_shadow = "none"          # extra signal back-projected through the 3rd aux channel (logging only)
+         self.sem_split = "adc"            # adc (densify_and_split_by_selected_mask) | mask2
+diff --git a/run_decisive.sh b/run_decisive.sh
+index e25d341..9e02f12 100644
+--- a/run_decisive.sh
++++ b/run_decisive.sh
+@@ -35,14 +35,25 @@ TAU_G=${TAU_G:-0.0002}   # positional-gradient threshold (3DGS default)
+ RHO=${RHO:-0.3}          # stratified sampling ratio: SET TO THE VALUE USED FOR THE REPORTED "Ours"
+ SPLIT=${SPLIT:-adc}      # densify_and_split_by_selected_mask (used for the reported "Ours")
+ 
++# ---------------- candidate set / interval options (applied to every arm) ----------------
++VALID_GRAD=${VALID_GRAD:-1}   # 1: exclude Gaussians with zero accumulated positional gradient (--sem_valid_grad)
++MIN_VIEWS=${MIN_VIEWS:-1}     # minimum number of valid views per densification interval (--sem_min_views)
++INTERVALS=${INTERVALS:-3}     # 3: G1/G2/G3 | 2: G2 and G3 merged (--sem_intervals)
++DINO_CHUNK=${DINO_CHUNK:-64}  # channel chunk of the DINOv2 feature upsampling (0: original path)
++GT_CACHE=${GT_CACHE:-cpu}     # GT DINOv2 feature cache: none | cpu | cuda
++OUTDOOR_IMG=${OUTDOOR_IMG:-images_4}   # Mip-NeRF 360 outdoor image folder (images_8 for a small local GPU)
++INDOOR_IMG=${INDOOR_IMG:-images_2}     # Mip-NeRF 360 indoor image folder
++
+ # ---------------- what to run ----------------
+ SCENES=${SCENES:-"flowers treehill garden truck"}
+ SEEDS=${SEEDS:-"0"}
+ ARMS=${ARMS:-"dino_l03 ssim_l03 l1_l03 dino_l0 ssim_l0 l1_l0 rand_matched radius_matched"}
+ 
+-ITER=30000
+-COMMON="--eval --disable_viewer --test_iterations -1 --save_iterations $ITER \
+---densify_grad_threshold $TAU_G --sem_sample_ratio $RHO --sem_split $SPLIT --sem_log"
++ITER=${ITER:-30000}      # ITER=15000 stops right after the densification phase (half the time)
++COMMON="--eval --disable_viewer --test_iterations -1 --iterations $ITER --save_iterations $ITER \
++--densify_grad_threshold $TAU_G --sem_sample_ratio $RHO --sem_split $SPLIT --sem_log \
++--sem_dino_chunk $DINO_CHUNK --sem_dino_gt_cache $GT_CACHE --sem_min_views $MIN_VIEWS --sem_intervals $INTERVALS"
++if [ "$VALID_GRAD" = 1 ]; then COMMON="$COMMON --sem_valid_grad"; fi
+ 
+ M360_OUTDOOR="bicycle flowers garden stump treehill"
+ M360_INDOOR="room counter kitchen bonsai"
+@@ -53,8 +64,8 @@ contains() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
+ 
+ scene_source() {   # prints "<source_path> <image_folder>"
+     local s=$1
+-    if contains "$M360_OUTDOOR" "$s"; then echo "$M360_DIR/$s images_8"
+-    elif contains "$M360_INDOOR" "$s"; then echo "$M360_DIR/$s images_2"
++    if contains "$M360_OUTDOOR" "$s"; then echo "$M360_DIR/$s $OUTDOOR_IMG"
++    elif contains "$M360_INDOOR" "$s"; then echo "$M360_DIR/$s $INDOOR_IMG"
+     elif contains "$TANDT_SCENES" "$s"; then echo "$TANDT_DIR/$s images"
+     elif contains "$DB_SCENES" "$s"; then echo "$DB_DIR/$s images"
+     else return 1; fi
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index cf0c975..f3fca36 100644
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -36,6 +36,9 @@ DEFAULT_SEM_CFG = {
+     "r9_cap": 0.05,
+     "split": "adc",            # adc | mask2
+     "radius_ref": 20.0,        # R_max, used for the "fraction >= R_max" statistic
++    "valid_grad": False,       # True: accumulated positional gradient must be > 0 to be a candidate
++    "min_views": 1,            # minimum number of valid views in the densification interval
++    "intervals": 3,            # 3: G1/G2/G3 | 2: G2 and G3 merged
+     "collect_stats": False,
+     "want_snapshot": False,
+     "snapshot_max_points": 200_000,
+@@ -1729,18 +1732,24 @@ class GaussianModel:
+         grad_mask = grad_mag >= max_grad
+ 
+         sim_score = self.get_similarity_score.squeeze(1).detach()
+-        # sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >= 0))
+-        sim_valid_mask = ((self.sim_view_count.squeeze(1) > 0) & (sim_score >= 0) & (grad_mag > 0))
++        # Candidate (valid) set. min_views=1 and valid_grad=False give the original condition
++        # (view count > 0, score >= 0); the view count is integer valued, so ">= 1" equals "> 0".
++        min_views = max(1, int(cfg["min_views"]))
++        sim_valid_mask = ((self.sim_view_count.squeeze(1) >= min_views) & (sim_score >= 0))
++        if cfg["valid_grad"]:
++            # A Gaussian with zero accumulated positional gradient does not affect the loss.
++            sim_valid_mask = sim_valid_mask & (grad_mag > 0)
++        intervals = int(cfg["intervals"])
+ 
+         select_info = {}
+         if cfg["mode"] == "ours":
+             if cfg["select"] == "stratified":
+-                semantic_densify_mask, plan = select_stratified(sim_score, sim_valid_mask, cfg["sample_ratio"])
++                semantic_densify_mask, plan = select_stratified(sim_score, sim_valid_mask, cfg["sample_ratio"], intervals)
+             elif cfg["select"] == "random_matched":
+-                semantic_densify_mask, plan = select_random_matched(sim_score, sim_valid_mask, cfg["sample_ratio"])
++                semantic_densify_mask, plan = select_random_matched(sim_score, sim_valid_mask, cfg["sample_ratio"], intervals)
+             elif cfg["select"] == "radius_matched":
+                 semantic_densify_mask, plan = select_radius_matched(sim_score, sim_valid_mask, cfg["sample_ratio"],
+-                                                                    self.get_mean_projected_radius())
++                                                                    self.get_mean_projected_radius(), intervals)
+             else:
+                 raise ValueError(f"Unknown semantic selection: {cfg['select']}")
+             select_info = {"score_mean": plan["mean"], "score_std": plan["std"],
+diff --git a/tests/test_decisive_cpu.py b/tests/test_decisive_cpu.py
+index 8b2819b..e156de9 100644
+--- a/tests/test_decisive_cpu.py
++++ b/tests/test_decisive_cpu.py
+@@ -187,7 +187,8 @@ def test_full_step_equivalence():
+ 
+     # other modes run and keep the bookkeeping consistent
+     for cfg in [{"select": "random_matched"}, {"select": "radius_matched"},
+-                {"mode": "r9", "r9_threshold": 0.05}, {"split": "mask2"}]:
++                {"mode": "r9", "r9_threshold": 0.05}, {"split": "mask2"},
++                {"valid_grad": True, "min_views": 2}, {"intervals": 2}, {"intervals": 2, "select": "radius_matched"}]:
+         m = make_model(new_mod)
+         inp = random_step_inputs(m.get_xyz.shape[0], seed=7)
+         apply_inputs(m, inp)
+@@ -248,6 +249,14 @@ def test_controls_and_r9():
+     check(info["cap_bound"] and int(m9.sum()) == int(0.05 * 20000), f"cap binds at 5% ({info})")
+     m9b, info_b = sem_select.select_threshold_cap(err, valid, 0.99, 0.05)
+     check(not info_b["cap_bound"] and int(m9b.sum()) == info_b["n_candidates"], f"below cap keeps all candidates ({info_b})")
++    # 2 intervals: G1 unchanged, G2 and G3 merged, third interval empty
++    p2 = sem_select.stratified_plan(score, valid, 0.3, intervals=2)
++    check(p2["counts"][0] == plan["counts"][0] and p2["counts"][1] == plan["counts"][1] + plan["counts"][2]
++          and p2["counts"][2] == 0 and p2["num_samples"][2] == 0, f"2 intervals: counts={p2['counts']}, K={p2['num_samples']}")
++    p3 = sem_select.stratified_plan(score, valid, 0.3, intervals=3)
++    check(p3["counts"] == plan["counts"] and p3["num_samples"] == plan["num_samples"], "intervals=3 equals the default plan")
++    torch.manual_seed(0); m2, _ = sem_select.select_stratified(score, valid, 0.3, intervals=2)
++    check(int(m2.sum()) == sum(p2["num_samples"]) and bool((m2 & ~valid).sum() == 0), "2 intervals: selects sum(K), valid only")
+     rho = sem_select.spearman(score, score * 2 + 1)
+     check(rho is not None and abs(rho - 1.0) < 1e-6, "spearman of a monotone transform = 1")
+ 
+@@ -277,11 +286,16 @@ def test_resolve_config():
+     exec(compile(ast.Module(body=keep, type_ignores=[]), "train_sim_subset", "exec"), ns)
+     base = dict(sem_mode="ours", sem_signal="dino", sem_shadow="none", sem_select="stratified", sem_split="adc",
+                 sem_view_norm="auto", sem_view_agg="auto", sem_sample_ratio=0.3, sem_r9_threshold=0.1, sem_r9_cap=0.05,
+-                sem_radius_max=20.0, sem_lambda_scale=0.3, sem_log=False)
++                sem_radius_max=20.0, sem_lambda_scale=0.3, sem_log=False, sem_scale_mode="linear",
++                sem_valid_grad=False, sem_min_views=1, sem_intervals=3)
+     cfg = ns["resolve_sem_config"](SimpleNamespace(**base))
+     check(cfg["view_norm"] == "mean" and cfg["view_agg"] == "mean", "ours: auto -> mean / mean")
+     cfg = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_mode="r9", sem_lambda_scale=0.0)))
+     check(cfg["view_norm"] == "sum" and cfg["view_agg"] == "max", "r9: auto -> sum / max")
++    d = ns["resolve_sem_config"](SimpleNamespace(**base))["densify"]
++    check(d["valid_grad"] is False and d["min_views"] == 1 and d["intervals"] == 3, "defaults: valid_grad off, min_views 1, 3 intervals")
++    d = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_valid_grad=True, sem_min_views=2, sem_intervals=2)))["densify"]
++    check(d["valid_grad"] is True and d["min_views"] == 2 and d["intervals"] == 2, "valid_grad / min_views / intervals are passed to the densify config")
+     line = ns["sem_console_line"](3000, {"n_total": 1234567, "n_grad": 1200, "n_sem": 300, "n_sem_only": 120,
+                                           "interval_counts": [4000, 300, 40], "interval_samples": [100, 100, 40],
+                                           "radius_sem": {"frac_ge_ref": 0.35}}, {"g3_only_by_scale_weight": 0.8})
+diff --git a/train_sim.py b/train_sim.py
+index e6639b1..2dc49d9 100644
+--- a/train_sim.py
++++ b/train_sim.py
+@@ -352,6 +352,10 @@ def resolve_sem_config(opt):
+     view_agg = opt.sem_view_agg if opt.sem_view_agg != "auto" else ("mean" if mode == "ours" else "max")
+     if view_norm not in ("mean", "sum"):
+         raise ValueError(f"--sem_view_norm must be auto|mean|sum, got '{opt.sem_view_norm}'")
++    if opt.sem_intervals not in (2, 3):
++        raise ValueError(f"--sem_intervals must be 2 or 3, got {opt.sem_intervals}")
++    if opt.sem_min_views < 1:
++        raise ValueError(f"--sem_min_views must be >= 1, got {opt.sem_min_views}")
+     if opt.sem_scale_mode not in ("linear", "power"):
+         raise ValueError(f"--sem_scale_mode must be linear|power, got '{opt.sem_scale_mode}'")
+ 
+@@ -377,6 +381,9 @@ def resolve_sem_config(opt):
+         "r9_cap": opt.sem_r9_cap,
+         "split": opt.sem_split,
+         "radius_ref": opt.sem_radius_max,
++        "valid_grad": bool(opt.sem_valid_grad),
++        "min_views": int(opt.sem_min_views),
++        "intervals": int(opt.sem_intervals),
+         "collect_stats": bool(opt.sem_log),
+     }
+     cfg = {"mode": mode, "signal": opt.sem_signal, "shadow": opt.sem_shadow,
+diff --git a/utils/sem_select.py b/utils/sem_select.py
+index d0ed35c..8c5f9b2 100644
+--- a/utils/sem_select.py
++++ b/utils/sem_select.py
+@@ -25,7 +25,7 @@ import torch
+ # Proposed rule
+ # ---------------------------------------------------------------------------
+ 
+-def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio):
++def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio, intervals=3):
+     """
+     Interval masks and per-interval sample sizes of the stratified sampling, without sampling.
+ 
+@@ -34,7 +34,13 @@ def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio):
+         counts       : [c1, c2, c3] (int)
+         num_samples  : [K1, K2, K3] (int, 0 for empty intervals)
+         mean, std    : score statistics over the valid candidates (float or None)
++
++    intervals=3 (default) is the original rule. intervals=2 merges G2 and G3 into one interval
++    (score < mean - 2 std); the third entry of masks / counts / num_samples is then empty (0),
++    so the returned lists keep their length and the logging code is unchanged.
+     """
++    if intervals not in (2, 3):
++        raise ValueError(f"intervals must be 2 or 3, got {intervals}")
+     plan = {"masks": None, "counts": [0, 0, 0], "num_samples": [0, 0, 0], "mean": None, "std": None}
+ 
+     if not sim_valid_mask.any():
+@@ -47,8 +53,12 @@ def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio):
+     plan["std"] = sim_std.item()
+ 
+     mask_high = (sim_valid_mask & (sim_score >= sim_mean - 2.0 * sim_std) & (sim_score < sim_mean - 1.0 * sim_std))
+-    mask_mid = (sim_valid_mask & (sim_score >= sim_mean - 3.0 * sim_std) & (sim_score < sim_mean - 2.0 * sim_std))
+-    mask_low = (sim_valid_mask & (sim_score < sim_mean - 3.0 * sim_std))
++    if intervals == 3:
++        mask_mid = (sim_valid_mask & (sim_score >= sim_mean - 3.0 * sim_std) & (sim_score < sim_mean - 2.0 * sim_std))
++        mask_low = (sim_valid_mask & (sim_score < sim_mean - 3.0 * sim_std))
++    else:
++        mask_mid = (sim_valid_mask & (sim_score < sim_mean - 2.0 * sim_std))   # G2 and G3 merged
++        mask_low = torch.zeros_like(sim_valid_mask)
+     masks = [mask_high, mask_mid, mask_low]
+     plan["masks"] = masks
+ 
+@@ -84,8 +94,8 @@ def stratified_plan(sim_score, sim_valid_mask, global_sample_ratio):
+     return plan
+ 
+ 
+-def select_stratified(sim_score, sim_valid_mask, global_sample_ratio):
+-    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio)
++def select_stratified(sim_score, sim_valid_mask, global_sample_ratio, intervals=3):
++    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio, intervals)
+     mask_out = torch.zeros_like(sim_score, dtype=torch.bool)
+     if plan["masks"] is None:
+         return mask_out, plan
+@@ -105,8 +115,8 @@ def select_stratified(sim_score, sim_valid_mask, global_sample_ratio):
+ # Controls (same count as the stratified plan)
+ # ---------------------------------------------------------------------------
+ 
+-def select_random_matched(sim_score, sim_valid_mask, global_sample_ratio):
+-    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio)
++def select_random_matched(sim_score, sim_valid_mask, global_sample_ratio, intervals=3):
++    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio, intervals)
+     mask_out = torch.zeros_like(sim_score, dtype=torch.bool)
+     k_total = int(sum(plan["num_samples"]))
+     if k_total == 0:
+@@ -118,9 +128,9 @@ def select_random_matched(sim_score, sim_valid_mask, global_sample_ratio):
+     return mask_out, plan
+ 
+ 
+-def select_radius_matched(sim_score, sim_valid_mask, global_sample_ratio, radius):
++def select_radius_matched(sim_score, sim_valid_mask, global_sample_ratio, radius, intervals=3):
+     """`radius`: [N] projected radius per Gaussian (mean over the valid views of the interval)."""
+-    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio)
++    plan = stratified_plan(sim_score, sim_valid_mask, global_sample_ratio, intervals)
+     mask_out = torch.zeros_like(sim_score, dtype=torch.bool)
+     k_total = int(sum(plan["num_samples"]))
+     if k_total == 0:
+-- 
+2.43.0
+

@@ -108,7 +108,7 @@ for scene in $SCENES; do
         for seed in $SEEDS; do
             out="$OUT_ROOT/$scene/$arm/seed$seed"
             mkdir -p "$out"
-            cmd="python train_sim.py -s $SRC -i images_8 -m $out --seed $seed $COMMON $flags"
+            cmd="python train_sim.py -s $SRC -i $IMG -m $out --seed $seed $COMMON $flags"
             echo "$cmd" > "$out/command.txt"
             echo "============================================================"
             echo "[decisive] $scene / $arm / seed$seed"

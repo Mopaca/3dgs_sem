@@ -1,0 +1,135 @@
+From 3830a014eb157e28d783f530364798a4f8827ed8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 16:46:04 +0900
+Subject: [PATCH] Per-view visibility bound: --sem_min_contrib_px
+
+A view counts as a valid observation of a Gaussian only if its contribution sum
+(sum over pixels of alpha * T) divided by the footprint area pi * radius^2 is at
+least the given value. Default 0 keeps the previous condition (contribution sum > 1e-6).
+run_decisive.sh: MIN_CONTRIB_PX environment variable (default 0).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PHmjveU9kNqt1TKBUX99W4
+---
+ DECISIVE_EXPERIMENT.md     |  2 +-
+ arguments/__init__.py      |  1 +
+ run_decisive.sh            |  4 +++-
+ tests/test_decisive_cpu.py |  5 ++++-
+ train_sim.py               | 11 ++++++++++-
+ 5 files changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/DECISIVE_EXPERIMENT.md b/DECISIVE_EXPERIMENT.md
+index 729ba29..56f3e64 100644
+--- a/DECISIVE_EXPERIMENT.md
++++ b/DECISIVE_EXPERIMENT.md
+@@ -51,7 +51,7 @@ python collect_results.py --root output/decisive
+ 
+ `--sem_signal dino|ssim|l1|l1_blur`, `--sem_mode ours|r9`, `--sem_select stratified|random_matched|radius_matched`, `--sem_view_norm auto|mean|sum`, `--sem_view_agg auto|mean|min|max`, `--sem_lambda_scale`, `--sem_radius_min`, `--sem_radius_max`, `--sem_sample_ratio`, `--sem_r9_threshold`, `--sem_r9_cap`, `--sem_blur_sigma`, `--sem_shadow`, `--sem_split adc|mask2`, `--sem_log`, 그리고 `train_sim.py`의 `--seed` (0이면 기존과 같은 고정 seed).
+ 
+-후보 집합과 구간 옵션: `--sem_valid_grad`(누적 위치 gradient가 정확히 0인 가우시안을 후보에서 제외), `--sem_min_views N`(densification 간격 안에서 N개 이상의 view에서 유효하게 관측된 가우시안만 후보, 기본 1), `--sem_intervals 3|2`(2이면 G2와 G3를 합쳐 평균 − 2σ 미만을 한 구간으로 둔다). 평균과 표준편차는 이 조건을 통과한 후보 집합에서 계산한다. `run_decisive.sh`에서는 `VALID_GRAD`(기본 1), `MIN_VIEWS`, `INTERVALS`, `DINO_CHUNK`, `GT_CACHE`, `OUTDOOR_IMG`, `INDOOR_IMG`, `ITER` 환경변수로 모든 조건에 공통으로 적용한다.
++후보 집합과 구간 옵션: `--sem_valid_grad`(누적 위치 gradient가 정확히 0인 가우시안을 후보에서 제외), `--sem_min_views N`(densification 간격 안에서 N개 이상의 view에서 유효하게 관측된 가우시안만 후보, 기본 1), `--sem_intervals 3|2`(2이면 G2와 G3를 합쳐 평균 − 2σ 미만을 한 구간으로 둔다). `--sem_min_contrib_px x`(기본 0, 꺼짐)는 view 단위 조건으로, 그 view에서의 기여도 합(픽셀들의 alpha × T 합)을 투영 반지름으로 만든 원의 넓이 π r²로 나눈 값이 x 이상일 때만 유효 관측으로 센다. 평균과 표준편차는 이 조건을 통과한 후보 집합에서 계산한다. `run_decisive.sh`에서는 `VALID_GRAD`(기본 1), `MIN_VIEWS`, `INTERVALS`, `DINO_CHUNK`, `GT_CACHE`, `OUTDOOR_IMG`, `INDOOR_IMG`, `ITER` 환경변수로 모든 조건에 공통으로 적용한다.
+ 
+ 기본값(dino, ours, stratified, adc, shadow 없음)에서는 기존 계산과 같다. ours 모드에서 가중 합(`--sem_view_norm sum`)은 막아 두었다. goodness 점수를 합하면 넓게 덮는 가우시안일수록 잘 복원된 것으로 판정되기 때문이며, 가중 합 비교는 오차 점수를 쓰는 r9 모드에서 한다.
+ 
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index 2e3cc07..48155af 100644
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -117,6 +117,7 @@ class OptimizationParams(ParamGroup):
+         self.sem_valid_grad = False       # True: Gaussians whose accumulated positional gradient is exactly 0 are not candidates
+         self.sem_min_views = 1            # candidates must be observed in at least this many views of the densification interval
+         self.sem_intervals = 3            # 3: G1/G2/G3 (proposed) | 2: G1 and (G2+G3 merged, score < mean - 2 std)
++        self.sem_min_contrib_px = 0.0     # >0: a view counts as an observation only if contribution sum / (pi * radius^2) >= this value
+         self.sem_blur_sigma = 4.0         # l1_blur: Gaussian blur sigma (px)
+         self.sem_shadow = "none"          # extra signal back-projected through the 3rd aux channel (logging only)
+         self.sem_split = "adc"            # adc (densify_and_split_by_selected_mask) | mask2
+diff --git a/run_decisive.sh b/run_decisive.sh
+index 9e02f12..8df0da3 100644
+--- a/run_decisive.sh
++++ b/run_decisive.sh
+@@ -39,6 +39,7 @@ SPLIT=${SPLIT:-adc}      # densify_and_split_by_selected_mask (used for the repo
+ VALID_GRAD=${VALID_GRAD:-1}   # 1: exclude Gaussians with zero accumulated positional gradient (--sem_valid_grad)
+ MIN_VIEWS=${MIN_VIEWS:-1}     # minimum number of valid views per densification interval (--sem_min_views)
+ INTERVALS=${INTERVALS:-3}     # 3: G1/G2/G3 | 2: G2 and G3 merged (--sem_intervals)
++MIN_CONTRIB_PX=${MIN_CONTRIB_PX:-0}   # >0: per-view visibility bound, contribution sum / (pi r^2) (--sem_min_contrib_px)
+ DINO_CHUNK=${DINO_CHUNK:-64}  # channel chunk of the DINOv2 feature upsampling (0: original path)
+ GT_CACHE=${GT_CACHE:-cpu}     # GT DINOv2 feature cache: none | cpu | cuda
+ OUTDOOR_IMG=${OUTDOOR_IMG:-images_4}   # Mip-NeRF 360 outdoor image folder (images_8 for a small local GPU)
+@@ -52,7 +53,8 @@ ARMS=${ARMS:-"dino_l03 ssim_l03 l1_l03 dino_l0 ssim_l0 l1_l0 rand_matched radius
+ ITER=${ITER:-30000}      # ITER=15000 stops right after the densification phase (half the time)
+ COMMON="--eval --disable_viewer --test_iterations -1 --iterations $ITER --save_iterations $ITER \
+ --densify_grad_threshold $TAU_G --sem_sample_ratio $RHO --sem_split $SPLIT --sem_log \
+---sem_dino_chunk $DINO_CHUNK --sem_dino_gt_cache $GT_CACHE --sem_min_views $MIN_VIEWS --sem_intervals $INTERVALS"
++--sem_dino_chunk $DINO_CHUNK --sem_dino_gt_cache $GT_CACHE --sem_min_views $MIN_VIEWS --sem_intervals $INTERVALS \
++--sem_min_contrib_px $MIN_CONTRIB_PX"
+ if [ "$VALID_GRAD" = 1 ]; then COMMON="$COMMON --sem_valid_grad"; fi
+ 
+ M360_OUTDOOR="bicycle flowers garden stump treehill"
+diff --git a/tests/test_decisive_cpu.py b/tests/test_decisive_cpu.py
+index 543e9d5..f15d329 100644
+--- a/tests/test_decisive_cpu.py
++++ b/tests/test_decisive_cpu.py
+@@ -293,13 +293,16 @@ def test_resolve_config():
+     base = dict(sem_mode="ours", sem_signal="dino", sem_shadow="none", sem_select="stratified", sem_split="adc",
+                 sem_view_norm="auto", sem_view_agg="auto", sem_sample_ratio=0.3, sem_r9_threshold=0.1, sem_r9_cap=0.05,
+                 sem_radius_max=20.0, sem_lambda_scale=0.3, sem_log=False, sem_scale_mode="linear",
+-                sem_valid_grad=False, sem_min_views=1, sem_intervals=3)
++                sem_valid_grad=False, sem_min_views=1, sem_intervals=3, sem_min_contrib_px=0.0)
+     cfg = ns["resolve_sem_config"](SimpleNamespace(**base))
+     check(cfg["view_norm"] == "mean" and cfg["view_agg"] == "mean", "ours: auto -> mean / mean")
+     cfg = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_mode="r9", sem_lambda_scale=0.0)))
+     check(cfg["view_norm"] == "sum" and cfg["view_agg"] == "max", "r9: auto -> sum / max")
+     d = ns["resolve_sem_config"](SimpleNamespace(**base))["densify"]
+     check(d["valid_grad"] is False and d["min_views"] == 1 and d["intervals"] == 3, "defaults: valid_grad off, min_views 1, 3 intervals")
++    c0 = ns["resolve_sem_config"](SimpleNamespace(**base))
++    c1 = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_min_contrib_px=3e-4)))
++    check(c0["min_contrib_px"] == 0.0 and abs(c1["min_contrib_px"] - 3e-4) < 1e-12, "min_contrib_px: default 0 (off), value passed through")
+     d = ns["resolve_sem_config"](SimpleNamespace(**dict(base, sem_valid_grad=True, sem_min_views=2, sem_intervals=2)))["densify"]
+     check(d["valid_grad"] is True and d["min_views"] == 2 and d["intervals"] == 2, "valid_grad / min_views / intervals are passed to the densify config")
+     line = ns["sem_console_line"](3000, {"n_total": 1234567, "n_grad": 1200, "n_sem": 300, "n_sem_only": 120,
+diff --git a/train_sim.py b/train_sim.py
+index 939c9ae..db73681 100644
+--- a/train_sim.py
++++ b/train_sim.py
+@@ -26,6 +26,7 @@ from utils.signal_maps import GuidanceMaps, SIGNALS ###
+ from utils.sem_logger import SemLogger ###
+ from utils.scale_weight_stats import scale_weight_analysis ###
+ import json ###
++import math ###
+ import time ###
+ import random ###
+ import subprocess ###
+@@ -210,6 +211,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                 view_visible_mask = view_visible_mask.unsqueeze(1)
+ 
+             visible_mask = view_visible_mask * (den_grad > 1e-6)
++            if sem_cfg["min_contrib_px"] > 0:
++                # Count the view as an observation only if the Gaussian is visible enough in it:
++                # mean alpha * T over its footprint (disc of the projected 3-sigma radius).
++                footprint = math.pi * radii.detach().float().unsqueeze(1).clamp_min(1.0) ** 2
++                visible_mask = visible_mask * ((den_grad / footprint) >= sem_cfg["min_contrib_px"])
+             # visible_mask = visible_mask * wma_weight
+ 
+             gaussians.accumulate_similarity(weighted_view_score, visible_mask, agg=sem_cfg["view_agg"],
+@@ -357,6 +363,8 @@ def resolve_sem_config(opt):
+         raise ValueError(f"--sem_intervals must be 2 or 3, got {opt.sem_intervals}")
+     if opt.sem_min_views < 1:
+         raise ValueError(f"--sem_min_views must be >= 1, got {opt.sem_min_views}")
++    if opt.sem_min_contrib_px < 0:
++        raise ValueError(f"--sem_min_contrib_px must be >= 0, got {opt.sem_min_contrib_px}")
+     if opt.sem_scale_mode not in ("linear", "power"):
+         raise ValueError(f"--sem_scale_mode must be linear|power, got '{opt.sem_scale_mode}'")
+ 
+@@ -388,7 +396,8 @@ def resolve_sem_config(opt):
+         "collect_stats": bool(opt.sem_log),
+     }
+     cfg = {"mode": mode, "signal": opt.sem_signal, "shadow": opt.sem_shadow,
+-           "view_norm": view_norm, "view_agg": view_agg, "scale_mode": opt.sem_scale_mode, "densify": densify_cfg}
++           "view_norm": view_norm, "view_agg": view_agg, "scale_mode": opt.sem_scale_mode,
++           "min_contrib_px": float(opt.sem_min_contrib_px), "densify": densify_cfg}
+     print(f"[sem] config: {json.dumps(cfg)}")
+     return cfg
+ 
+-- 
+2.43.0
+
